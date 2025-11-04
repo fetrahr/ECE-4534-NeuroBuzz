@@ -18,8 +18,15 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
+# Optional plotting (FFT/PSD)
+try:
+    import matplotlib.pyplot as plt
+    _HAS_MPL = True
+except Exception:
+    _HAS_MPL = False
+
 from brainflow.board_shim import BoardShim, BrainFlowInputParams, BoardIds
-from brainflow.data_filter import DataFilter, FilterTypes, DetrendOperations
+from brainflow.data_filter import DataFilter, FilterTypes, DetrendOperations, WindowFunctions
 from brainflow.ml_model import (
     MLModel,
     BrainFlowModelParams,
@@ -43,6 +50,11 @@ class Config:
 
     # Channels of interest (override after connecting using BoardShim.get_eeg_channels)
     eeg_channels: List[int] | None = None
+
+    # Live FFT/PSD plot
+    enable_plot: bool = False
+    plot_channel_index: int = 0   # index into eeg_channels list
+    plot_nfft: int = 512          # FFT size for display
 
     # Metric thresholds (tune!)
     relax_low: float = 0.40
@@ -153,6 +165,15 @@ class EEGToHaptics:
 
         print(f"Connected. sr={self.sr} Hz, eeg_chs={self.eeg_chs}, window={self.window_samples} samples")
 
+        # Setup live plot if requested
+        if self.cfg.enable_plot and _HAS_MPL:
+            try:
+                self._init_plot()
+            except Exception as e:
+                print(f"[plot] init failed: {e}")
+        elif self.cfg.enable_plot and not _HAS_MPL:
+            print("[warn] matplotlib not available — disable --plot or install it to see FFT.")
+
         # Warm-up buffer
         self._wait_for_samples(self.window_samples)
 
@@ -234,6 +255,13 @@ class EEGToHaptics:
                 "STRESS": self.models["STRESS"].predict(feature_vec),
             }
 
+            # Optional: update spectrum plot for a quick sanity check
+            if self.cfg.enable_plot and _HAS_MPL:
+                try:
+                    self._update_plot(eeg_win)
+                except Exception as e:
+                    print(f"[plot] error: {e}")
+
             # Map to haptics policy
             intensity, pattern, dur = self._policy(scores)
 
@@ -314,6 +342,42 @@ class EEGToHaptics:
         return intensity, pattern_id, duration_ms
 
 
+# -------- Plotting (FFT/PSD) --------
+    def _init_plot(self):
+        # Single-subplot spectrum display
+        self._fig, self._ax = plt.subplots(figsize=(7, 4))
+        (self._line,) = self._ax.plot([], [])
+        self._ax.set_title("EEG Spectrum (Welch PSD)")
+        self._ax.set_xlabel("Frequency [Hz]")
+        self._ax.set_ylabel("Power [a.u.]")
+        self._ax.set_xlim(0, self.cfg.bandpass_high + 5)
+        self._ax.set_ylim(1e-8, 1e2)
+        self._ax.set_yscale("log")
+        self._fig.tight_layout()
+        plt.pause(0.001)
+
+    def _update_plot(self, eeg_win: np.ndarray):
+        # Choose channel to display
+        chs = self.eeg_chs
+        if not chs:
+            return
+        idx = int(np.clip(self.cfg.plot_channel_index, 0, len(chs)-1))
+        x = np.copy(eeg_win[idx, :])
+
+        # Welch PSD via BrainFlow helper
+        nfft = int(self.cfg.plot_nfft)
+        psd, freqs = DataFilter.get_psd_welch(
+            x, nfft, nfft // 2, self.sr, WindowFunctions.HANNING.value
+        )
+
+        # Update line
+        self._line.set_data(freqs, psd)
+        self._ax.set_xlim(0, min(self.cfg.bandpass_high + 5, float(np.max(freqs)) if freqs.size else 50.0))
+        y_max = max(float(np.max(psd)) if psd.size else 1e-2, 1e-2)
+        y_min = max(float(np.min(psd[psd > 0])) if psd.size and np.any(psd > 0) else 1e-8, 1e-8)
+        self._ax.set_ylim(y_min, y_max)
+        plt.pause(0.001)
+
 # =========================
 # CLI / Entrypoint
 # =========================
@@ -330,6 +394,7 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument("--window", type=float, default=4.0, help="Seconds per inference window")
     parser.add_argument("--step", type=float, default=1.0, help="Seconds per inference step")
     parser.add_argument("--notch", type=float, default=60.0, help="Notch center frequency (0 to disable)")
+    parser.add_argument("--plot", action="store_true", help="Show live FFT/PSD plot (matplotlib)")
     args = parser.parse_args(argv)
 
     cfg = Config(
@@ -337,6 +402,7 @@ def main(argv: List[str] | None = None) -> int:
         window_sec=args.window,
         step_sec=args.step,
         notch=args.notch,
+        enable_plot=args.plot,
         drv2605l_addresses=[0x5A],  # EDIT: add all your motor driver I2C addresses
     )
 
