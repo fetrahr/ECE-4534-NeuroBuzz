@@ -1,7 +1,7 @@
 import argparse
 import time
 
-from brainflow.board_shim import BoardShim, BrainFlowInputParams, LogLevels
+from brainflow.board_shim import BoardShim, BrainFlowInputParams, LogLevels, BoardIds
 from brainflow.data_filter import DataFilter
 from brainflow.ml_model import MLModel, BrainFlowMetrics, BrainFlowClassifiers, BrainFlowModelParams
 
@@ -130,8 +130,8 @@ def main():
     restfulness = MLModel(restfulness_params)
     restfulness.prepare()
     
-    MINDFULNESS_THRESHOLD = 0.5
-    RESTFULNESS_THRESHOLD = 0.5
+    MINDFULNESS_THRESHOLD = 0.7
+    RESTFULNESS_THRESHOLD = 0.7
 
     eeg_channels = BoardShim.get_eeg_channels(int(master_board_id))
     
@@ -164,12 +164,8 @@ def main():
             restfulness_detected = restfulness_score >= RESTFULNESS_THRESHOLD
 
             # print so you can see what's happening
-            print(
-                f"Mindfulness: {mindfulness_score:.3f} "
-                f"(detected={mindfulness_detected}), "
-                f"Restfulness: {restfulness_score:.3f} "
-                f"(detected={restfulness_detected})"
-            )
+            print('Mindfulness: %s' % str(mindfulness_score))
+            print('Restfulness: %s' % str(restfulness_score))
 
             buzz_from_metrics(mindfulness_detected, restfulness_detected)
 
