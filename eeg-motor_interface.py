@@ -43,6 +43,39 @@ def make_drv_for_channel(ch: int, use_lra: bool, lib: int):
 
 drivers = [make_drv_for_channel(ch, USE_LRA, LRA_LIBRARY) for ch in CHANNELS]
 
+def trigger_single_motor(motor_index: int, effect: int = DEFAULT_EFFECT):
+    """
+    Trigger a single motor by index (0,1,2).
+    Uses sequence[0] with a single effect and calls play().
+    """
+    if not (0 <= motor_index < len(drivers)):
+        return
+    ch = CHANNELS[motor_index]
+    drv = drivers[motor_index]
+    tca_select(ch)
+    drv.sequence[0] = adafruit_drv2605.Effect(effect)
+    drv.play()
+
+
+def buzz_from_metrics(mindfulness_detected: bool, restfulness_detected: bool):
+    """
+    Map EEG metrics → motors:
+      - Motor 0: buzz when NEITHER mindfulness nor restfulness detected
+      - Motor 1: buzz when mindfulness detected
+      - Motor 2: buzz when restfulness detected
+    """
+    # 1) "Neutral / no metric" buzz: only when both are False
+    if not mindfulness_detected and not restfulness_detected:
+        trigger_single_motor(0)
+
+    # 2) Mindfulness buzz
+    if mindfulness_detected:
+        trigger_single_motor(1)
+
+    # 3) Restfulness buzz
+    if restfulness_detected:
+        trigger_single_motor(2)
+
 def main():
     BoardShim.enable_board_logger()
     DataFilter.enable_data_logger()
@@ -138,13 +171,7 @@ def main():
                 f"(detected={restfulness_detected})"
             )
 
-            # here is where you’d hook into other code, e.g.:
-            # if mindfulness_detected:
-            #     # TODO: send command over I2C to motor controller
-            #     pass
-            # if restfulness_detected:
-            #     # TODO: different motor pattern
-            #     pass
+            buzz_from_metrics(mindfulness_detected, restfulness_detected)
 
     except KeyboardInterrupt:
         print("Stopping on user interrupt...")
@@ -155,6 +182,14 @@ def main():
         board.release_session()
         mindfulness.release()
         restfulness.release()
+
+        # stop motors on exit
+        for ch, drv in zip(CHANNELS, drivers):
+            try:
+                tca_select(ch)
+                drv.stop()
+            except Exception:
+                pass
 
 
 
