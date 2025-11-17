@@ -5,6 +5,43 @@ from brainflow.board_shim import BoardShim, BrainFlowInputParams, LogLevels
 from brainflow.data_filter import DataFilter
 from brainflow.ml_model import MLModel, BrainFlowMetrics, BrainFlowClassifiers, BrainFlowModelParams
 
+# ---------- Motor / I2C imports ----------
+import board
+import busio
+from adafruit_bus_device.i2c_device import I2CDevice
+import adafruit_drv2605
+
+# ---------- Motor Config ----------
+MUX_ADDR = 0x70
+CHANNELS = [0, 1, 2]      # 3 motors on mux channels 0,1,2
+USE_LRA = True            # True for LRA, False for ERM
+LRA_LIBRARY = 6           # 6 for LRA, 1 for ERM
+MAX_EFFECT = 123          # DRV2605 effect range 1..123
+DEFAULT_EFFECT = 1        # simple click / buzz pattern
+
+
+# ---------- I2C + MUX ----------
+i2c = busio.I2C(board.SCL, board.SDA)
+
+def tca_select(ch: int):
+    """Select TCA9548A mux channel."""
+    with I2CDevice(i2c, MUX_ADDR) as mux:
+        mux.write(bytes([1 << ch]))
+    time.sleep(0.002)
+
+def make_drv_for_channel(ch: int, use_lra: bool, lib: int):
+    """Create and configure a DRV2605 instance for a mux channel."""
+    tca_select(ch)
+    drv = adafruit_drv2605.DRV2605(i2c)
+    if use_lra:
+        drv.use_LRM()
+        drv.library = lib
+    else:
+        drv.use_ERM()
+        drv.library = 1
+    return drv
+
+drivers = [make_drv_for_channel(ch, USE_LRA, LRA_LIBRARY) for ch in CHANNELS]
 
 def main():
     BoardShim.enable_board_logger()
@@ -24,14 +61,15 @@ def main():
     parser.add_argument('--other-info', type=str, help='other info', required=False, default='')
     parser.add_argument('--streamer-params', type=str, help='streamer params', required=False, default='')
     parser.add_argument('--serial-number', type=str, help='serial number', required=False, default='')
-    parser.add_argument('--board-id', type=int, help='board id, check docs to get a list of supported boards',
-                        required=True)
+    #parser.add_argument('--board-id', type=int, help='board id, check docs to get a list of supported boards',
+    #
+    #                     required=True)
     parser.add_argument('--file', type=str, help='file', required=False, default='')
     args = parser.parse_args()
 
     params = BrainFlowInputParams()
     params.ip_port = args.ip_port
-    params.serial_port = args.serial_port
+    params.serial_port = '/dev/ttyUSB0'
     params.mac_address = args.mac_address
     params.other_info = args.other_info
     params.serial_number = args.serial_number
@@ -40,35 +78,84 @@ def main():
     params.timeout = args.timeout
     params.file = args.file
 
-    board = BoardShim(args.board_id, params)
+    board = BoardShim(BoardIds.CYTON_BOARD, params)
     master_board_id = board.get_board_id()
     sampling_rate = BoardShim.get_sampling_rate(master_board_id)
+
+
     board.prepare_session()
     board.start_stream(45000, args.streamer_params)
-    BoardShim.log_message(LogLevels.LEVEL_INFO.value, 'start sleeping in the main thread')
-    time.sleep(5)  # recommended window size for eeg metric calculation is at least 4 seconds, bigger is better
-    data = board.get_board_data()
-    board.stop_stream()
-    board.release_session()
-
-    eeg_channels = BoardShim.get_eeg_channels(int(master_board_id))
-    bands = DataFilter.get_avg_band_powers(data, eeg_channels, sampling_rate, True)
-    feature_vector = bands[0]
-    print(feature_vector)
-
+    BoardShim.log_message(LogLevels.LEVEL_INFO.value, 'Start continuous EEG metric loop')
+    
     mindfulness_params = BrainFlowModelParams(BrainFlowMetrics.MINDFULNESS.value,
                                               BrainFlowClassifiers.DEFAULT_CLASSIFIER.value)
     mindfulness = MLModel(mindfulness_params)
     mindfulness.prepare()
-    print('Mindfulness: %s' % str(mindfulness.predict(feature_vector)))
-    mindfulness.release()
-
+    
     restfulness_params = BrainFlowModelParams(BrainFlowMetrics.RESTFULNESS.value,
                                               BrainFlowClassifiers.DEFAULT_CLASSIFIER.value)
     restfulness = MLModel(restfulness_params)
     restfulness.prepare()
-    print('Restfulness: %s' % str(restfulness.predict(feature_vector)))
-    restfulness.release()
+    
+    MINDFULNESS_THRESHOLD = 0.5
+    RESTFULNESS_THRESHOLD = 0.5
+
+    eeg_channels = BoardShim.get_eeg_channels(int(master_board_id))
+    
+    window_sec = 4
+    num_samples = int(window_sec * sampling_rate)
+
+    try:
+        while True:
+            # give the buffer time to fill
+            time.sleep(window_sec)
+
+            # get the most recent window of data
+            data = board.get_current_board_data(num_samples)
+
+            # safety check: skip iteration if not enough data yet
+            if data.shape[1] < num_samples:
+                print("Not enough data yet, waiting...")
+                continue
+
+            # compute band powers and feature vector
+            bands = DataFilter.get_avg_band_powers(data, eeg_channels, sampling_rate, True)
+            feature_vector = bands[0]
+
+            # compute metrics
+            mindfulness_score = mindfulness.predict(feature_vector)
+            restfulness_score = restfulness.predict(feature_vector)
+
+            # booleans indicating whether each state is "detected"
+            mindfulness_detected = mindfulness_score >= MINDFULNESS_THRESHOLD
+            restfulness_detected = restfulness_score >= RESTFULNESS_THRESHOLD
+
+            # print so you can see what's happening
+            print(
+                f"Mindfulness: {mindfulness_score:.3f} "
+                f"(detected={mindfulness_detected}), "
+                f"Restfulness: {restfulness_score:.3f} "
+                f"(detected={restfulness_detected})"
+            )
+
+            # here is where you’d hook into other code, e.g.:
+            # if mindfulness_detected:
+            #     # TODO: send command over I2C to motor controller
+            #     pass
+            # if restfulness_detected:
+            #     # TODO: different motor pattern
+            #     pass
+
+    except KeyboardInterrupt:
+        print("Stopping on user interrupt...")
+
+    finally:
+        # clean up
+        board.stop_stream()
+        board.release_session()
+        mindfulness.release()
+        restfulness.release()
+
 
 
 if __name__ == "__main__":
