@@ -156,16 +156,22 @@ def main():
             feature_vector = bands[0]
 
             # compute metrics
-            mindfulness_score = mindfulness.predict(feature_vector)
-            restfulness_score = restfulness.predict(feature_vector)
+            mindfulness_score = float(mindfulness.predict(feature_vector)[0])
+            restfulness_score = float(restfulness.predict(feature_vector)[0])
 
             # booleans indicating whether each state is "detected"
             mindfulness_detected = mindfulness_score >= MINDFULNESS_THRESHOLD
             restfulness_detected = restfulness_score >= RESTFULNESS_THRESHOLD
 
             # print so you can see what's happening
-            print('Mindfulness: %s' % str(mindfulness_score))
-            print('Restfulness: %s' % str(restfulness_score))
+            
+            print(
+                f"Mindfulness: {mindfulness_score:.3f} "
+                f"(detected={mindfulness_score >= MINDFULNESS_THRESHOLD}), "
+                f"Restfulness: {restfulness_score:.3f} "
+                f"(detected={restfulness_score >= RESTFULNESS_THRESHOLD})"
+            )
+            print()
 
             buzz_from_metrics(mindfulness_detected, restfulness_detected)
 
