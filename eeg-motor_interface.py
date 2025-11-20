@@ -1,5 +1,7 @@
 import argparse
 import time
+import sys
+import select
 
 from brainflow.board_shim import BoardShim, BrainFlowInputParams, LogLevels, BoardIds
 from brainflow.data_filter import DataFilter
@@ -56,25 +58,57 @@ def trigger_single_motor(motor_index: int, effect: int = DEFAULT_EFFECT):
     drv.sequence[0] = adafruit_drv2605.Effect(effect)
     drv.play()
 
-
-def buzz_from_metrics(mindfulness_detected: bool, restfulness_detected: bool):
+def run_motor_pattern(mindfulness_detected: bool,
+                      restfulness_detected: bool,
+                      motors_enabled: bool):
     """
-    Map EEG metrics → motors:
-      - Motor 0: buzz when NEITHER mindfulness nor restfulness detected
-      - Motor 1: buzz when mindfulness detected
-      - Motor 2: buzz when restfulness detected
+    Map EEG metrics → motor patterns:
+
+      - Mindfulness only  (True, False):
+          buzz left->right
+
+      - Restfulness only (False, True):
+          buzz right->left
+
+      - Neither or both (False, False) or (True, True):
+          all motors buzz once (periodic "baseline" buzz)
     """
-    # 1) "Neutral / no metric" buzz: only when both are False
-    if not mindfulness_detected and not restfulness_detected:
-        trigger_single_motor(0)
+    if not motors_enabled:
+        return
 
-    # 2) Mindfulness buzz
-    if mindfulness_detected:
-        trigger_single_motor(1)
+    # Mindfulness only: left -> right
+    if mindfulness_detected and not restfulness_detected:
+        for idx in CHANNELS:
+            trigger_single_motor(idx)
+            time.sleep(0.1)  # step timing between motors
+        return
 
-    # 3) Restfulness buzz
-    if restfulness_detected:
-        trigger_single_motor(2)
+    # Restfulness only: right -> left
+    if restfulness_detected and not mindfulness_detected:
+        for idx in CHANNELS:
+            trigger_single_motor(idx)
+            time.sleep(0.1)
+        return
+
+    # Neither (or both) detected: buzz all motors once (periodic)
+    for idx in CHANNELS:
+        trigger_single_motor(idx)
+    # no extra sleep here; "periodic" is driven by the metrics update rate
+
+def check_for_s_toggle(motors_enabled: bool) -> bool:
+    """
+    Non-blocking check for 's' from stdin.
+    Type 's' + Enter to toggle motor output on/off.
+    """
+    # Check if there's any input ready on stdin
+    rlist, _, _ = select.select([sys.stdin], [], [], 0)
+    if sys.stdin in rlist:
+        line = sys.stdin.readline().strip().lower()
+        if line == 's':
+            motors_enabled = not motors_enabled
+            state = "ENABLED" if motors_enabled else "DISABLED"
+            print(f"[motors] {state}")
+    return motors_enabled
 
 def main():
     BoardShim.enable_board_logger()
@@ -119,6 +153,7 @@ def main():
     board.prepare_session()
     board.start_stream(45000, args.streamer_params)
     BoardShim.log_message(LogLevels.LEVEL_INFO.value, 'Start continuous EEG metric loop')
+    print("Type 's' + Enter to toggle motors on/off. Ctrl+C to exit.\n")
     
     mindfulness_params = BrainFlowModelParams(BrainFlowMetrics.MINDFULNESS.value,
                                               BrainFlowClassifiers.DEFAULT_CLASSIFIER.value)
@@ -138,8 +173,13 @@ def main():
     window_sec = 4
     num_samples = int(window_sec * sampling_rate)
 
+    motors_enabled = True
+
     try:
         while True:
+            # allow user to toggle motors while loop is running
+            motors_enabled = check_for_s_toggle(motors_enabled)
+            
             # give the buffer time to fill
             time.sleep(window_sec)
 
@@ -173,7 +213,11 @@ def main():
             )
             print()
 
-            buzz_from_metrics(mindfulness_detected, restfulness_detected)
+            run_motor_pattern(
+                mindfulness_detected,
+                restfulness_detected,
+                motors_enabled
+            )
 
     except KeyboardInterrupt:
         print("Stopping on user interrupt...")
