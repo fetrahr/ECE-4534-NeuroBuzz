@@ -24,6 +24,107 @@ LRA_LIBRARY = 6           # 6 for LRA, 1 for ERM
 MAX_EFFECT = 123          # DRV2605 effect range 1..123
 DEFAULT_EFFECT = 120        # simple click / buzz pattern
 
+class RealTimePlotter:
+    """
+    Real-time plots:
+      - Top: EEG time series (last window for each EEG channel)
+      - Bottom: bandpower time series for each brainwave band
+    """
+    def __init__(self, eeg_channels, sampling_rate, window_sec):
+        self.eeg_channels = eeg_channels
+        self.sampling_rate = sampling_rate
+        self.window_sec = window_sec
+
+        self.n_eeg_channels = len(eeg_channels)
+        self.n_samples = int(window_sec * sampling_rate)
+
+        # Time axis for EEG window: e.g. from -4 to 0 seconds
+        self.t_eeg = np.linspace(-window_sec, 0, self.n_samples)
+
+        # Band names in BrainFlow's order (delta, theta, alpha, beta, gamma)
+        self.band_names = ["Delta", "Theta", "Alpha", "Beta", "Gamma"]
+        self.n_bands = len(self.band_names)
+
+        # History for band powers
+        self.band_times = []
+        self.band_history = [[] for _ in range(self.n_bands)]
+
+        # Set up figure
+        plt.ion()
+        self.fig, (self.ax_eeg, self.ax_band) = plt.subplots(2, 1, figsize=(10, 7))
+
+        # EEG lines
+        self.eeg_lines = []
+        for i, ch in enumerate(self.eeg_channels):
+            line, = self.ax_eeg.plot([], [], label=f"Ch {ch}")
+            self.eeg_lines.append(line)
+
+        self.ax_eeg.set_title("EEG Time Series (last window)")
+        self.ax_eeg.set_xlabel("Time (s)")
+        self.ax_eeg.set_ylabel("Amplitude (µV)")
+        self.ax_eeg.legend(loc="upper right")
+
+        # Bandpower lines
+        self.band_lines = []
+        for i, name in enumerate(self.band_names):
+            line, = self.ax_band.plot([], [], label=name)
+            self.band_lines.append(line)
+
+        self.ax_band.set_title("Bandpower Time Series")
+        self.ax_band.set_xlabel("Time (s)")
+        self.ax_band.set_ylabel("Power (a.u.)")
+        self.ax_band.legend(loc="upper right")
+
+        self.start_time = time.time()
+
+    def update_eeg(self, eeg_window):
+        """
+        eeg_window: shape (n_eeg_channels, n_samples)
+        Plots last window_sec of EEG data.
+        """
+        if eeg_window.shape[1] != self.n_samples:
+            # Recompute time vector just in case
+            self.n_samples = eeg_window.shape[1]
+            self.t_eeg = np.linspace(-self.window_sec, 0, self.n_samples)
+
+        # Update each channel line
+        for i, line in enumerate(self.eeg_lines):
+            if i < eeg_window.shape[0]:
+                line.set_data(self.t_eeg, eeg_window[i, :])
+
+        # Adjust axes
+        self.ax_eeg.set_xlim(self.t_eeg[0], self.t_eeg[-1])
+        y_min = float(np.min(eeg_window))
+        y_max = float(np.max(eeg_window))
+        if y_min == y_max:
+            y_min -= 1.0
+            y_max += 1.0
+        self.ax_eeg.set_ylim(y_min, y_max)
+
+    def update_bands(self, band_powers):
+        """
+        band_powers: 1D array-like of length 5 (delta..gamma)
+        Appends a new timepoint and updates bandpower traces.
+        """
+        t = time.time() - self.start_time
+        self.band_times.append(t)
+
+        # Ensure band_powers is a flat array
+        band_powers = np.asarray(band_powers).flatten()
+
+        for i in range(self.n_bands):
+            if i < len(band_powers):
+                self.band_history[i].append(float(band_powers[i]))
+                self.band_lines[i].set_data(self.band_times, self.band_history[i])
+
+        self.ax_band.relim()
+        self.ax_band.autoscale_view()
+
+    def refresh(self):
+        """Redraw the figure without blocking."""
+        self.fig.canvas.draw_idle()
+        plt.pause(0.001)
+
 
 # ---------- I2C + MUX ----------
 i2c = busio.I2C(board.SCL, board.SDA)
@@ -351,6 +452,10 @@ def main():
     window_sec = 4
     num_samples = int(window_sec * sampling_rate)
 
+    # Real-time plots
+    plotter = RealTimePlotter(eeg_channels, sampling_rate, window_sec)
+
+
     motors_enabled = True
 
     try:
@@ -375,6 +480,10 @@ def main():
             if data.shape[1] < num_samples:
                 print("Not enough data yet, waiting...")
                 continue
+
+            # ---- update EEG time-series plot (last window) ----
+            eeg_window = data[eeg_channels, :]  # shape: (n_channels, num_samples)
+            plotter.update_eeg(eeg_window)
 
             # compute band powers and feature vector
             bands = DataFilter.get_avg_band_powers(
