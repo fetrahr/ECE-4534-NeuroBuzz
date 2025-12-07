@@ -1,34 +1,17 @@
 import argparse
 import time
-import sys
 
 from brainflow.board_shim import BoardShim, BrainFlowInputParams, LogLevels, BoardIds
 from brainflow.data_filter import DataFilter
-from brainflow.ml_model import MLModel, BrainFlowMetrics, BrainFlowClassifiers, BrainFlowModelParams
+from brainflow.ml_model import (
+    MLModel,
+    BrainFlowMetrics,
+    BrainFlowClassifiers,
+    BrainFlowModelParams,
+)
 
 import numpy as np
 import pyqtgraph as pg
-from pyqtgraph.Qt import QtWidgets
-
-def collect_segment(board, duration_s, sampling_rate):
-    """
-    Collect 'duration_s' seconds of data from the board.
-    """
-    collected = []
-    t_start = time.time()
-
-    while time.time() - t_start < duration_s:
-        chunk = board.get_board_data()
-        if chunk.size > 0:
-            collected.append(chunk)
-        time.sleep(0.05)
-
-    if collected:
-        data = np.concatenate(collected, axis=1)
-    else:
-        n_samples = int(duration_s * sampling_rate)
-        data = board.get_current_board_data(n_samples)
-    return data
 
 
 def main():
@@ -49,9 +32,10 @@ def main():
     parser.add_argument('--file', type=str, required=False, default='')
     args = parser.parse_args()
 
+    # For the dummy board, we basically don't need any connection params
     params = BrainFlowInputParams()
     params.ip_port = args.ip_port
-    params.serial_port = '/dev/ttyUSB0'  # hard-coded for your setup
+    params.serial_port = args.serial_port  # ignored by synthetic board
     params.mac_address = args.mac_address
     params.other_info = args.other_info
     params.serial_number = args.serial_number
@@ -60,15 +44,18 @@ def main():
     params.timeout = args.timeout
     params.file = args.file
 
-    board = BoardShim(BoardIds.CYTON_BOARD, params)
+    # --- use BrainFlow's synthetic (dummy) board here ---
+    board = BoardShim(BoardIds.SYNTHETIC_BOARD, params)
     master_board_id = board.get_board_id()
     sampling_rate = BoardShim.get_sampling_rate(master_board_id)
 
     board.prepare_session()
     board.start_stream(45000, args.streamer_params)
-    BoardShim.log_message(LogLevels.LEVEL_INFO.value, 'Start continuous EEG metric loop')
-    print("Running real-time EEG + bandpower viewer. Ctrl+C to exit.\n")
+    BoardShim.log_message(LogLevels.LEVEL_INFO.value,
+                          'Start continuous EEG metric loop (synthetic board)')
+    print("Running real-time EEG + bandpower viewer with SYNTHETIC_BOARD. Ctrl+C to exit.\n")
 
+    # --- ML models ---
     mindfulness_params = BrainFlowModelParams(
         BrainFlowMetrics.MINDFULNESS.value,
         BrainFlowClassifiers.DEFAULT_CLASSIFIER.value
@@ -87,55 +74,46 @@ def main():
     RESTFULNESS_THRESHOLD = 0.7
 
     eeg_channels = BoardShim.get_eeg_channels(int(master_board_id))
+    n_ch = len(eeg_channels)
 
-    window_sec = 4
+    window_sec = 4.0
     num_samples = int(window_sec * sampling_rate)
 
-    # ---------- pyqtgraph + Qt setup ----------
+    # ---------- pyqtgraph setup ----------
     app = pg.mkQApp("EEG + Bandpower Viewer")
+    win = pg.GraphicsLayoutWidget(title="EEG + Bandpower (Synthetic Board)")
+    win.resize(1000, 800)
 
-    # Main window widget and layout
-    main_win = QtWidgets.QWidget()
-    main_layout = QtWidgets.QVBoxLayout(main_win)
+    # === EEG plot (all channels stacked like OpenBCI) ===
+    eeg_plot = win.addPlot(row=0, col=0, title="EEG Time Series (last window)")
+    eeg_plot.setLabel('bottom', 'Time', units='s')
+    eeg_plot.getAxis('left').setTicks([])  # no y ticks
+    eeg_plot.showGrid(x=True, y=True, alpha=0.2)
 
-    # --- Scroll area for EEG channel plots ---
-    scroll = QtWidgets.QScrollArea()
-    scroll.setWidgetResizable(True)
+    spacing = 100.0  # vertical spacing between channels
 
-    eeg_container = QtWidgets.QWidget()
-    eeg_layout = QtWidgets.QVBoxLayout(eeg_container)
-
-    eeg_plots = []
     eeg_curves = []
+    channel_labels = []
 
-    # One PlotWidget per EEG channel, stacked vertically
     for i, ch in enumerate(eeg_channels):
-        pw = pg.PlotWidget()
-        pw.setMinimumHeight(120)  # so ~4 fit on screen
-        pw.setLabel('left', f"Ch {ch}", units='µV')
-        pw.setLabel('bottom', 'Time', units='s')  # label on EVERY plot
+        # distinct colors per channel
+        pen = pg.intColor(i, hues=n_ch, maxValue=255)
 
-        # Link x-axes so zoom/pan stay aligned
-        if i > 0:
-            pw.setXLink(eeg_plots[0])
-
-        curve = pw.plot()
-        eeg_plots.append(pw)
+        curve = eeg_plot.plot(pen=pen)
         eeg_curves.append(curve)
-        eeg_layout.addWidget(pw)
 
-    eeg_container.setLayout(eeg_layout)
-    scroll.setWidget(eeg_container)
+        label = pg.TextItem(f"Ch {ch}", color=pen, anchor=(1, 0.5))
+        eeg_plot.addItem(label)
+        channel_labels.append(label)
 
-    # Add scroll area to main layout
-    main_layout.addWidget(scroll, stretch=3)
+    eeg_plot.setYRange(-spacing, spacing * (n_ch + 1))
 
-    # --- Bandpower plot at the bottom (last 4 seconds only) ---
-    band_plot = pg.PlotWidget(title="Bandpower Time Series (last 4 s)")
+    # === Bandpower plot (bottom) ===
+    band_plot = win.addPlot(row=1, col=0, title="Bandpower Time Series (last 4 s)")
     band_plot.setLabel('bottom', 'Time', units='s')
     band_plot.setLabel('left', 'Power', units='a.u.')
+    band_plot.showGrid(x=True, y=True, alpha=0.2)
 
-    # Band names + frequency ranges (typical BrainFlow defaults)
     band_info = [
         ("Delta", "1–4 Hz"),
         ("Theta", "4–8 Hz"),
@@ -145,24 +123,19 @@ def main():
     ]
 
     legend = band_plot.addLegend()
-
     band_curves = []
     for i, (name, freq_range) in enumerate(band_info):
         label = f"{name} ({freq_range})"
-        curve = band_plot.plot(pen=i, name=label)
+        pen = pg.intColor(i, hues=len(band_info), maxValue=255)
+        curve = band_plot.plot(pen=pen, name=label)
         band_curves.append(curve)
 
     band_times = []
     band_history = [[] for _ in band_info]
-    band_window_sec = 4.0  # show last 4 seconds
+    band_window_sec = 4.0
     t0 = time.time()
 
-    main_layout.addWidget(band_plot, stretch=1)
-
-    main_win.setLayout(main_layout)
-    main_win.resize(900, 700)
-    main_win.show()
-
+    win.show()
 
     try:
         while True:
@@ -180,51 +153,46 @@ def main():
                 print("Not enough data yet, waiting...")
                 continue
 
-            # ---- EEG: per-channel plots ----
-            eeg_window = data[eeg_channels, :]  # shape: (n_channels, num_samples)
+            # ========== EEG update ==========
+            eeg_window = data[eeg_channels, :]  # shape: (n_ch, num_samples)
             t_eeg = np.linspace(-window_sec, 0, num_samples)
 
-            for ch_idx, curve in enumerate(eeg_curves):
-                if ch_idx < eeg_window.shape[0]:
-                    chan_data = eeg_window[ch_idx, :]
-                    curve.setData(t_eeg, chan_data)
+            max_abs = float(np.max(np.abs(eeg_window))) if eeg_window.size > 0 else 1.0
+            if max_abs < 1e-6:
+                max_abs = 1.0
+            scale = 0.4 * spacing / max_abs  # scale to fit within strips
 
-                    # auto-scale Y for each channel separately
-                    y_min = float(np.min(chan_data))
-                    y_max = float(np.max(chan_data))
-                    if y_min == y_max:
-                        y_min -= 1.0
-                        y_max += 1.0
-                    eeg_plots[ch_idx].setYRange(y_min, y_max)
+            for idx, curve in enumerate(eeg_curves):
+                if idx < eeg_window.shape[0]:
+                    sig = eeg_window[idx, :].astype(float)
+                    sig = sig - np.mean(sig)
+                    sig = sig * scale
 
-            # ---- band powers (delta..gamma) ----
+                    offset = (n_ch - 1 - idx) * spacing
+                    curve.setData(t_eeg, sig + offset)
+
+                    channel_labels[idx].setPos(t_eeg[0], offset)
+
+            eeg_plot.setXRange(-window_sec, 0.0, padding=0)
+
+            # ========== Bandpower update ==========
             bands = DataFilter.get_avg_band_powers(
                 data, eeg_channels, sampling_rate, True
             )
             feature_vector = bands[0]  # delta, theta, alpha, beta, gamma
 
-            # ---- update bandpower time-series (last 4 seconds only) ----
             t_now = time.time() - t0
             band_times.append(t_now)
+
             fv = np.asarray(feature_vector).flatten()
             for i in range(len(band_info)):
                 if i < len(fv):
                     band_history[i].append(float(fv[i]))
+                    band_curves[i].setData(band_times, band_history[i])
 
-            # Trim history to last 4 seconds
-            t_min = t_now - band_window_sec
-            # Drop from the front while too old
-            while band_times and band_times[0] < t_min:
-                band_times.pop(0)
-                for hist in band_history:
-                    if hist:
-                        hist.pop(0)
+            band_plot.setXRange(t_now - band_window_sec, t_now, padding=0)
 
-            # Update curves with trimmed data
-            for i, curve in enumerate(band_curves):
-                curve.setData(band_times, band_history[i])
-
-            # ---- metrics ----
+            # ========== Metrics update ==========
             mindfulness_score = float(mindfulness.predict(feature_vector)[0])
             restfulness_score = float(restfulness.predict(feature_vector)[0])
 
