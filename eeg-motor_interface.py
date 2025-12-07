@@ -113,14 +113,9 @@ def main():
         pw = pg.PlotWidget()
         pw.setMinimumHeight(120)  # so ~4 fit on screen
         pw.setLabel('left', f"Ch {ch}", units='µV')
+        pw.setLabel('bottom', 'Time', units='s')  # label on EVERY plot
 
-        if i == 0:
-            pw.setLabel('bottom', 'Time', units='s')
-        else:
-            # Hide x-axis tick labels for all but bottom-most (they share x)
-            pw.getAxis('bottom').setStyle(showValues=False)
-
-        # Link x-axes so panning/zoom syncs across channels
+        # Link x-axes so zoom/pan stay aligned
         if i > 0:
             pw.setXLink(eeg_plots[0])
 
@@ -135,19 +130,31 @@ def main():
     # Add scroll area to main layout
     main_layout.addWidget(scroll, stretch=3)
 
-    # --- Bandpower plot at the bottom ---
-    band_plot = pg.PlotWidget(title="Bandpower Time Series")
+    # --- Bandpower plot at the bottom (last 4 seconds only) ---
+    band_plot = pg.PlotWidget(title="Bandpower Time Series (last 4 s)")
     band_plot.setLabel('bottom', 'Time', units='s')
     band_plot.setLabel('left', 'Power', units='a.u.')
 
-    band_names = ["Delta", "Theta", "Alpha", "Beta", "Gamma"]
+    # Band names + frequency ranges (typical BrainFlow defaults)
+    band_info = [
+        ("Delta", "1–4 Hz"),
+        ("Theta", "4–8 Hz"),
+        ("Alpha", "8–13 Hz"),
+        ("Beta",  "13–30 Hz"),
+        ("Gamma", "30–45 Hz"),
+    ]
+
+    legend = band_plot.addLegend()
+
     band_curves = []
-    for i, name in enumerate(band_names):
-        curve = band_plot.plot(pen=i, name=name)
+    for i, (name, freq_range) in enumerate(band_info):
+        label = f"{name} ({freq_range})"
+        curve = band_plot.plot(pen=i, name=label)
         band_curves.append(curve)
 
     band_times = []
-    band_history = [[] for _ in band_names]
+    band_history = [[] for _ in band_info]
+    band_window_sec = 4.0  # show last 4 seconds
     t0 = time.time()
 
     main_layout.addWidget(band_plot, stretch=1)
@@ -182,7 +189,7 @@ def main():
                     chan_data = eeg_window[ch_idx, :]
                     curve.setData(t_eeg, chan_data)
 
-                    # auto-scale Y for each individual channel plot
+                    # auto-scale Y for each channel separately
                     y_min = float(np.min(chan_data))
                     y_max = float(np.max(chan_data))
                     if y_min == y_max:
@@ -190,19 +197,32 @@ def main():
                         y_max += 1.0
                     eeg_plots[ch_idx].setYRange(y_min, y_max)
 
-            # ---- band powers ----
+            # ---- band powers (delta..gamma) ----
             bands = DataFilter.get_avg_band_powers(
                 data, eeg_channels, sampling_rate, True
             )
             feature_vector = bands[0]  # delta, theta, alpha, beta, gamma
 
+            # ---- update bandpower time-series (last 4 seconds only) ----
             t_now = time.time() - t0
             band_times.append(t_now)
             fv = np.asarray(feature_vector).flatten()
-            for i in range(len(band_names)):
+            for i in range(len(band_info)):
                 if i < len(fv):
                     band_history[i].append(float(fv[i]))
-                    band_curves[i].setData(band_times, band_history[i])
+
+            # Trim history to last 4 seconds
+            t_min = t_now - band_window_sec
+            # Drop from the front while too old
+            while band_times and band_times[0] < t_min:
+                band_times.pop(0)
+                for hist in band_history:
+                    if hist:
+                        hist.pop(0)
+
+            # Update curves with trimmed data
+            for i, curve in enumerate(band_curves):
+                curve.setData(band_times, band_history[i])
 
             # ---- metrics ----
             mindfulness_score = float(mindfulness.predict(feature_vector)[0])
