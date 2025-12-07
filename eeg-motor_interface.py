@@ -92,7 +92,8 @@ def main():
     # === EEG plot (all channels stacked like OpenBCI) ===
     eeg_plot = win.addPlot(row=0, col=0, title="EEG Time Series (last window)")
     eeg_plot.setLabel('bottom', 'Time', units='s')
-    eeg_plot.getAxis('left').setTicks([])  # no y ticks
+    eeg_plot.getAxis('left').setTicks([])       # no y ticks
+    eeg_plot.getAxis('left').setStyle(showValues=False)
     eeg_plot.showGrid(x=True, y=True, alpha=0.2)
 
     spacing = 100.0  # vertical spacing between channels in display units
@@ -113,7 +114,6 @@ def main():
 
     rms_labels = []
     for i in range(n_ch):
-        # empty text for now; white text, right-anchored, with semi-transparent background
         rms_label = pg.TextItem(
             "",                       # text set in update()
             color='w',
@@ -130,7 +130,7 @@ def main():
     band_plot.setLabel('bottom', 'Time', units='s')
     band_plot.setLabel('left', 'Power', units='a.u.')
     band_plot.showGrid(x=True, y=True, alpha=0.2)
-    
+
     # --- make left axes the same width so x-axes line up ---
     left_axis_width = 60  # tweak this until it looks nice
     eeg_plot.getAxis('left').setWidth(left_axis_width)
@@ -156,6 +156,70 @@ def main():
     band_history = [[] for _ in band_info]
     band_window_sec = 4.0
     t0 = time.time()
+
+    # --- Metric window (separate) ---
+    metrics_win = QtWidgets.QWidget()
+    metrics_win.setWindowTitle("EEG Metrics")
+    metrics_layout = QtWidgets.QHBoxLayout(metrics_win)
+
+    # Left side: single indicator box + label
+    indicator_layout = QtWidgets.QVBoxLayout()
+
+    # colors for metrics
+    mind_color = (0, 200, 255)   # cyan-ish
+    rest_color = (0, 255, 0)     # green
+
+    # Status box
+    status_box = QtWidgets.QFrame()
+    status_box.setFixedSize(40, 40)
+    status_box.setStyleSheet("background-color: gray; border: 1px solid white;")
+
+    # Status label
+    status_label = QtWidgets.QLabel("Neither detected")
+    status_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+
+    indicator_layout.addWidget(status_box, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
+    indicator_layout.addWidget(status_label)
+
+    metrics_layout.addLayout(indicator_layout)
+
+    # Right side: metric plot
+    metrics_plot = pg.PlotWidget(title="EEG Metrics (last 4 s)")
+    metrics_plot.setLabel('bottom', 'Time', units='s')
+    metrics_plot.setLabel('left', 'Metric', units='')
+    metrics_plot.setYRange(0.0, 1.0)
+    metrics_plot.setXRange(-4.0, 0.0, padding=0)
+    metrics_plot.showGrid(x=True, y=True, alpha=0.2)
+
+    # Curves for metrics
+    mind_pen = pg.mkPen(color=mind_color, width=2)
+    rest_pen = pg.mkPen(color=rest_color, width=2)
+
+    mind_curve = metrics_plot.plot(pen=mind_pen, name="Mindfulness")
+    rest_curve = metrics_plot.plot(pen=rest_pen, name="Restfulness")
+
+    # Threshold lines (dotted)
+    mind_thresh_line = pg.InfiniteLine(
+        pos=MINDFULNESS_THRESHOLD,
+        angle=0,
+        pen=pg.mkPen(color=mind_color, style=QtCore.Qt.PenStyle.DotLine)
+    )
+    rest_thresh_line = pg.InfiniteLine(
+        pos=RESTFULNESS_THRESHOLD,
+        angle=0,
+        pen=pg.mkPen(color=rest_color, style=QtCore.Qt.PenStyle.DotLine)
+    )
+    metrics_plot.addItem(mind_thresh_line)
+    metrics_plot.addItem(rest_thresh_line)
+
+    # History for metrics
+    metric_times = []
+    mind_history = []
+    rest_history = []
+
+    metrics_layout.addWidget(metrics_plot)
+    metrics_win.resize(600, 300)
+    metrics_win.show()
 
     # --- timing / update configuration ---
     update_speed_ms = 50          # how often to refresh plots (20 Hz)
@@ -188,12 +252,11 @@ def main():
         # Get current view range, so labels/boxes track the visible area
         vb = eeg_plot.getViewBox()
         x_min, x_max = vb.viewRange()[0]
-        x_left  = x_min + 0.02 * (x_max - x_min)   # 2% in from left for channel labels
+        x_left = x_min + 0.02 * (x_max - x_min)    # 2% in from left for channel labels
         x_right = x_max - 0.02 * (x_max - x_min)   # 2% in from right for RMS boxes
 
         for idx, curve in enumerate(eeg_curves):
             if idx < eeg_window.shape[0]:
-                # raw channel data for RMS (in whatever units BrainFlow gives, usually µV)
                 raw_chan = eeg_window[idx, :].astype(float)
 
                 # draw signal (detrended + scaled + offset)
@@ -203,18 +266,15 @@ def main():
                 offset = (n_ch - 1 - idx) * spacing
                 curve.setData(t_eeg, sig + offset)
 
-                # --- left-side channel name label ---
+                # left-side channel name label
                 channel_labels[idx].setPos(x_left, offset)
 
-                # --- right-side RMS "box" ---
-                # RMS of detrended signal in original units
-                rms_val = np.sqrt(np.mean(raw_chan**2))
+                # right-side RMS box (RMS in original units)
+                rms_val = np.sqrt(np.mean(raw_chan ** 2))
                 rms_labels[idx].setPos(x_right, offset)
                 rms_labels[idx].setText(f"{rms_val:5.1f} µV")
 
         eeg_plot.setXRange(-window_sec, 0.0, padding=0)
-
-
 
         # ========== Bandpower update (EVERY frame) ==========
         now = time.time()
@@ -225,20 +285,16 @@ def main():
 
         t_now = now - t0
         band_times.append(t_now)
-
         fv = np.asarray(feature_vector).flatten()
 
-        # compute relative times for plotting (seconds from "now")
-        band_times_rel = [t - t_now for t in band_times]  # will be ..., -3.8, -3.7, ..., 0
+        # relative times for bandpower plot (last 4 s shown)
+        band_times_rel = [t - t_now for t in band_times]
 
         for i, curve in enumerate(band_curves):
             if i < len(fv):
                 band_history[i].append(float(fv[i]))
-                # plot using relative times, but keep underlying band_times untouched
                 curve.setData(band_times_rel, band_history[i])
 
-        # visually show only -4 .. 0 on the x-axis
-        band_window_sec = 4.0
         band_plot.setXRange(-band_window_sec, 0.0, padding=0)
 
         # ========== Metrics update (slower rate) ==========
@@ -253,6 +309,35 @@ def main():
         mindfulness_detected = mindfulness_score >= MINDFULNESS_THRESHOLD
         restfulness_detected = restfulness_score >= RESTFULNESS_THRESHOLD
 
+        # --- update metric history for plotting ---
+        metric_t_now = now - t0
+        metric_times.append(metric_t_now)
+        mind_history.append(mindfulness_score)
+        rest_history.append(restfulness_score)
+
+        metric_times_rel = [t - metric_t_now for t in metric_times]
+        mind_curve.setData(metric_times_rel, mind_history)
+        rest_curve.setData(metric_times_rel, rest_history)
+        metrics_plot.setXRange(-4.0, 0.0, padding=0)
+
+        # --- update single indicator box + label ---
+        gray_style = "background-color: gray; border: 1px solid white;"
+        mind_style = f"background-color: rgb({mind_color[0]},{mind_color[1]},{mind_color[2]}); border: 1px solid white;"
+        rest_style = f"background-color: rgb({rest_color[0]},{rest_color[1]},{rest_color[2]}); border: 1px solid white;"
+
+        if not mindfulness_detected and not restfulness_detected:
+            status_box.setStyleSheet(gray_style)
+            status_label.setText("Neither detected")
+        else:
+            # if both detected, choose whichever metric is stronger
+            if mindfulness_detected and (not restfulness_detected or mindfulness_score >= restfulness_score):
+                status_box.setStyleSheet(mind_style)
+                status_label.setText("Mindfulness detected")
+            else:
+                status_box.setStyleSheet(rest_style)
+                status_label.setText("Restfulness detected")
+
+        # optional: still print to console
         print(
             f"Mindfulness: {mindfulness_score:.3f} "
             f"(detected={mindfulness_detected}), "
