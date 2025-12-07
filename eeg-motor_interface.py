@@ -1,5 +1,8 @@
 import argparse
 import time
+import csv
+import os
+from datetime import datetime
 
 from brainflow.board_shim import BoardShim, BrainFlowInputParams, LogLevels, BoardIds
 from brainflow.data_filter import DataFilter
@@ -13,6 +16,112 @@ from brainflow.ml_model import (
 import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
+
+
+class EEGLogger:
+    """
+    Logs two CSV files:
+
+      1) Raw samples (eeg_raw_*.csv):
+         brainflow_ts, ch_<id>...
+
+      2) Features (eeg_features_*.csv):
+         brainflow_ts, delta, theta, alpha, beta, gamma,
+         mindfulness_score, restfulness_score,
+         mindfulness_detected, restfulness_detected
+
+    Usage:
+        logger = EEGLogger()
+        logger.start(eeg_channels)
+        ...
+        logger.log_raw(data, ts_idx, eeg_channels)
+        logger.log_features(ts, bands, mind, rest, mind_det, rest_det)
+        ...
+        logger.stop()
+    """
+    def __init__(self):
+        self.raw_file = None
+        self.feature_file = None
+        self.raw_writer = None
+        self.feature_writer = None
+        self.last_logged_ts = None  # last brainflow_ts logged for raw samples
+
+    def start(self, eeg_channels, base_dir=".", prefix="eeg_session"):
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        raw_path = os.path.join(base_dir, f"{prefix}_raw_{timestamp_str}.csv")
+        feat_path = os.path.join(base_dir, f"{prefix}_features_{timestamp_str}.csv")
+
+        self.raw_file = open(raw_path, "w", newline="")
+        self.feature_file = open(feat_path, "w", newline="")
+        self.raw_writer = csv.writer(self.raw_file)
+        self.feature_writer = csv.writer(self.feature_file)
+        self.last_logged_ts = None
+
+        # raw header: brainflow_ts + one column per EEG channel
+        raw_header = ["brainflow_ts"] + [f"ch_{ch}" for ch in eeg_channels]
+        self.raw_writer.writerow(raw_header)
+
+        # feature header
+        feat_header = [
+            "brainflow_ts",
+            "delta", "theta", "alpha", "beta", "gamma",
+            "mindfulness_score", "restfulness_score",
+            "mindfulness_detected", "restfulness_detected",
+        ]
+        self.feature_writer.writerow(feat_header)
+
+        print(f"[LOGGER] Raw EEG -> {raw_path}")
+        print(f"[LOGGER] Features -> {feat_path}")
+
+    def log_raw(self, data, timestamp_channel, eeg_channels):
+        """
+        data: full data matrix from BoardShim.get_current_board_data(...)
+        timestamp_channel: index of BrainFlow timestamp channel
+        eeg_channels: list of EEG channel indices
+        """
+        if self.raw_writer is None:
+            return
+
+        timestamps = data[timestamp_channel, :]  # shape: (num_samples,)
+        if timestamps.size == 0:
+            return
+
+        # Only log samples with timestamp > last_logged_ts
+        for col in range(timestamps.shape[0]):
+            ts = float(timestamps[col])
+            if (self.last_logged_ts is None) or (ts > self.last_logged_ts):
+                row = [ts]
+                for ch_idx in eeg_channels:
+                    row.append(float(data[ch_idx, col]))
+                self.raw_writer.writerow(row)
+
+        self.last_logged_ts = float(timestamps[-1])
+
+    def log_features(self, feature_ts, bands, mind_score, rest_score,
+                     mind_detected, rest_detected):
+        if self.feature_writer is None:
+            return
+        # bands: 5-element vector [delta..gamma]
+        row = [
+            float(feature_ts),
+            float(bands[0]), float(bands[1]), float(bands[2]),
+            float(bands[3]), float(bands[4]),
+            float(mind_score), float(rest_score),
+            int(bool(mind_detected)), int(bool(rest_detected)),
+        ]
+        self.feature_writer.writerow(row)
+
+    def stop(self):
+        if self.raw_file is not None:
+            self.raw_file.close()
+            self.raw_file = None
+        if self.feature_file is not None:
+            self.feature_file.close()
+            self.feature_file = None
+        self.raw_writer = None
+        self.feature_writer = None
+        self.last_logged_ts = None
+        print("[LOGGER] Closed log files.")
 
 
 def main():
@@ -79,10 +188,17 @@ def main():
 
     eeg_channels = BoardShim.get_eeg_channels(int(master_board_id))
     n_ch = len(eeg_channels)
+    timestamp_channel = BoardShim.get_timestamp_channel(master_board_id)
 
     # Window length for analysis (seconds) and number of samples per window
     window_sec = 4.0
     num_samples = int(window_sec * sampling_rate)
+
+    # ---------- logger setup ----------
+    logger = EEGLogger()
+    logging_enabled = False  # TODO: later wire this to a Qt checkbox
+    if logging_enabled:
+        logger.start(eeg_channels)
 
     # ---------- pyqtgraph / Qt setup ----------
     app = pg.mkQApp("EEG + Bandpower Viewer")
@@ -102,23 +218,21 @@ def main():
     channel_labels = []
 
     for i, ch in enumerate(eeg_channels):
-        # distinct colors per channel
         pen = pg.intColor(i, hues=n_ch, maxValue=255)
-
         curve = eeg_plot.plot(pen=pen)
         eeg_curves.append(curve)
 
-        label = pg.TextItem(f"Ch {ch}", color=pen, anchor=(0, 0.5))  # left-middle anchor
+        label = pg.TextItem(f"Ch {ch}", color=pen, anchor=(0, 0.5))
         eeg_plot.addItem(label)
         channel_labels.append(label)
 
     rms_labels = []
     for i in range(n_ch):
         rms_label = pg.TextItem(
-            "",                       # text set in update()
+            "",
             color='w',
-            anchor=(1, 0.5),          # right-middle anchor
-            fill=pg.mkBrush(0, 0, 0, 180)  # black-ish background for box effect
+            anchor=(1, 0.5),
+            fill=pg.mkBrush(0, 0, 0, 180)
         )
         eeg_plot.addItem(rms_label)
         rms_labels.append(rms_label)
@@ -131,8 +245,8 @@ def main():
     band_plot.setLabel('left', 'Power', units='a.u.')
     band_plot.showGrid(x=True, y=True, alpha=0.2)
 
-    # --- make left axes the same width so x-axes line up ---
-    left_axis_width = 60  # tweak this until it looks nice
+    # make left axes the same width so x-axes line up
+    left_axis_width = 60
     eeg_plot.getAxis('left').setWidth(left_axis_width)
     band_plot.getAxis('left').setWidth(left_axis_width)
 
@@ -165,16 +279,13 @@ def main():
     # Left side: single indicator box + label
     indicator_layout = QtWidgets.QVBoxLayout()
 
-    # colors for metrics
-    mind_color = (0, 200, 255)   # cyan-ish
-    rest_color = (0, 255, 0)     # green
+    mind_color = (0, 200, 255)
+    rest_color = (0, 255, 0)
 
-    # Status box
     status_box = QtWidgets.QFrame()
     status_box.setFixedSize(40, 40)
     status_box.setStyleSheet("background-color: gray; border: 1px solid white;")
 
-    # Status label
     status_label = QtWidgets.QLabel("Neither detected")
     status_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
 
@@ -191,14 +302,12 @@ def main():
     metrics_plot.setXRange(-4.0, 0.0, padding=0)
     metrics_plot.showGrid(x=True, y=True, alpha=0.2)
 
-    # Curves for metrics
     mind_pen = pg.mkPen(color=mind_color, width=2)
     rest_pen = pg.mkPen(color=rest_color, width=2)
 
     mind_curve = metrics_plot.plot(pen=mind_pen, name="Mindfulness")
     rest_curve = metrics_plot.plot(pen=rest_pen, name="Restfulness")
 
-    # Threshold lines (dotted)
     mind_thresh_line = pg.InfiniteLine(
         pos=MINDFULNESS_THRESHOLD,
         angle=0,
@@ -212,7 +321,6 @@ def main():
     metrics_plot.addItem(mind_thresh_line)
     metrics_plot.addItem(rest_thresh_line)
 
-    # History for metrics
     metric_times = []
     mind_history = []
     rest_history = []
@@ -222,8 +330,8 @@ def main():
     metrics_win.show()
 
     # --- timing / update configuration ---
-    update_speed_ms = 50          # how often to refresh plots (20 Hz)
-    metrics_period = 1.0          # how often to recompute metrics/print
+    update_speed_ms = 50
+    metrics_period = 1.0
     last_metrics_time = time.time()
 
     win.show()
@@ -232,62 +340,55 @@ def main():
     def update():
         nonlocal last_metrics_time
 
-        # get the most recent window of data
         data = board.get_current_board_data(num_samples)
-
-        # skip if not enough data yet
         if data.shape[1] < num_samples:
             return
 
-        # ========== EEG update (every timer tick) ==========
-        eeg_window = data[eeg_channels, :]  # shape: (n_ch, num_samples)
+        # log raw samples if enabled
+        if logging_enabled:
+            logger.log_raw(data, timestamp_channel, eeg_channels)
+
+        # ===== EEG update =====
+        eeg_window = data[eeg_channels, :]
         t_eeg = np.linspace(-window_sec, 0, num_samples)
 
         max_abs = float(np.max(np.abs(eeg_window))) if eeg_window.size > 0 else 1.0
         if max_abs < 1e-6:
             max_abs = 1.0
-        # scale to fit within strip spacing
         scale = 0.4 * spacing / max_abs
 
-        # Get current view range, so labels/boxes track the visible area
         vb = eeg_plot.getViewBox()
         x_min, x_max = vb.viewRange()[0]
-        x_left = x_min + 0.02 * (x_max - x_min)    # 2% in from left for channel labels
-        x_right = x_max - 0.02 * (x_max - x_min)   # 2% in from right for RMS boxes
+        x_left = x_min + 0.02 * (x_max - x_min)
+        x_right = x_max - 0.02 * (x_max - x_min)
 
         for idx, curve in enumerate(eeg_curves):
             if idx < eeg_window.shape[0]:
                 raw_chan = eeg_window[idx, :].astype(float)
-
-                # draw signal (detrended + scaled + offset)
                 sig = raw_chan - np.mean(raw_chan)
                 sig = sig * scale
 
                 offset = (n_ch - 1 - idx) * spacing
                 curve.setData(t_eeg, sig + offset)
 
-                # left-side channel name label
                 channel_labels[idx].setPos(x_left, offset)
 
-                # right-side RMS box (RMS in original units)
                 rms_val = np.sqrt(np.mean(raw_chan ** 2))
                 rms_labels[idx].setPos(x_right, offset)
                 rms_labels[idx].setText(f"{rms_val:5.1f} µV")
 
         eeg_plot.setXRange(-window_sec, 0.0, padding=0)
 
-        # ========== Bandpower update (EVERY frame) ==========
+        # ===== Bandpower every frame =====
         now = time.time()
         bands = DataFilter.get_avg_band_powers(
             data, eeg_channels, sampling_rate, True
         )
-        feature_vector = bands[0]  # delta, theta, alpha, beta, gamma
+        feature_vector = bands[0]
 
         t_now = now - t0
         band_times.append(t_now)
         fv = np.asarray(feature_vector).flatten()
-
-        # relative times for bandpower plot (last 4 s shown)
         band_times_rel = [t - t_now for t in band_times]
 
         for i, curve in enumerate(band_curves):
@@ -297,7 +398,7 @@ def main():
 
         band_plot.setXRange(-band_window_sec, 0.0, padding=0)
 
-        # ========== Metrics update (slower rate) ==========
+        # ===== Metrics & feature logging at slower rate =====
         if now - last_metrics_time < metrics_period:
             return
 
@@ -309,7 +410,7 @@ def main():
         mindfulness_detected = mindfulness_score >= MINDFULNESS_THRESHOLD
         restfulness_detected = restfulness_score >= RESTFULNESS_THRESHOLD
 
-        # --- update metric history for plotting ---
+        # metric history for plotting
         metric_t_now = now - t0
         metric_times.append(metric_t_now)
         mind_history.append(mindfulness_score)
@@ -320,7 +421,17 @@ def main():
         rest_curve.setData(metric_times_rel, rest_history)
         metrics_plot.setXRange(-4.0, 0.0, padding=0)
 
-        # --- update single indicator box + label ---
+        # log features if enabled
+        if logging_enabled:
+            # use latest BrainFlow timestamp in the window as feature timestamp
+            feature_ts = float(data[timestamp_channel, -1])
+            logger.log_features(
+                feature_ts, feature_vector,
+                mindfulness_score, restfulness_score,
+                mindfulness_detected, restfulness_detected
+            )
+
+        # update indicator box & label
         gray_style = "background-color: gray; border: 1px solid white;"
         mind_style = f"background-color: rgb({mind_color[0]},{mind_color[1]},{mind_color[2]}); border: 1px solid white;"
         rest_style = f"background-color: rgb({rest_color[0]},{rest_color[1]},{rest_color[2]}); border: 1px solid white;"
@@ -329,7 +440,6 @@ def main():
             status_box.setStyleSheet(gray_style)
             status_label.setText("Neither detected")
         else:
-            # if both detected, choose whichever metric is stronger
             if mindfulness_detected and (not restfulness_detected or mindfulness_score >= restfulness_score):
                 status_box.setStyleSheet(mind_style)
                 status_label.setText("Mindfulness detected")
@@ -337,7 +447,6 @@ def main():
                 status_box.setStyleSheet(rest_style)
                 status_label.setText("Restfulness detected")
 
-        # optional: still print to console
         print(
             f"Mindfulness: {mindfulness_score:.3f} "
             f"(detected={mindfulness_detected}), "
@@ -346,7 +455,6 @@ def main():
         )
         print()
 
-    # ---------- QTimer driving the update loop ----------
     timer = QtCore.QTimer()
     timer.timeout.connect(update)
     timer.start(update_speed_ms)
@@ -358,6 +466,8 @@ def main():
         board.release_session()
         mindfulness.release()
         restfulness.release()
+        if logging_enabled:
+            logger.stop()
 
 
 if __name__ == "__main__":
