@@ -8,6 +8,7 @@ from brainflow.ml_model import MLModel, BrainFlowMetrics, BrainFlowClassifiers, 
 
 import numpy as np
 import pyqtgraph as pg
+from pyqtgraph.Qt import QtWidgets
 
 def collect_segment(board, duration_s, sampling_rate):
     """
@@ -90,25 +91,54 @@ def main():
     window_sec = 4
     num_samples = int(window_sec * sampling_rate)
 
-    # ---------- pyqtgraph setup ----------
+    # ---------- pyqtgraph + Qt setup ----------
     app = pg.mkQApp("EEG + Bandpower Viewer")
-    win = pg.GraphicsLayoutWidget(title="EEG + Bandpower")
-    win.resize(900, 700)
 
-    # Top: EEG time series
-    eeg_plot = win.addPlot(row=0, col=0, title="EEG Time Series (last window)")
-    eeg_plot.setLabel('bottom', 'Time', units='s')
-    eeg_plot.setLabel('left', 'Amplitude', units='µV')
+    # Main window widget and layout
+    main_win = QtWidgets.QWidget()
+    main_layout = QtWidgets.QVBoxLayout(main_win)
 
+    # --- Scroll area for EEG channel plots ---
+    scroll = QtWidgets.QScrollArea()
+    scroll.setWidgetResizable(True)
+
+    eeg_container = QtWidgets.QWidget()
+    eeg_layout = QtWidgets.QVBoxLayout(eeg_container)
+
+    eeg_plots = []
     eeg_curves = []
-    for i, ch in enumerate(eeg_channels):
-        curve = eeg_plot.plot(pen=i, name=f"Ch {ch}")
-        eeg_curves.append(curve)
 
-    # Bottom: Bandpower time series
-    band_plot = win.addPlot(row=1, col=0, title="Bandpower Time Series")
+    # One PlotWidget per EEG channel, stacked vertically
+    for i, ch in enumerate(eeg_channels):
+        pw = pg.PlotWidget()
+        pw.setMinimumHeight(120)  # so ~4 fit on screen
+        pw.setLabel('left', f"Ch {ch}", units='µV')
+
+        if i == 0:
+            pw.setLabel('bottom', 'Time', units='s')
+        else:
+            # Hide x-axis tick labels for all but bottom-most (they share x)
+            pw.getAxis('bottom').setStyle(showValues=False)
+
+        # Link x-axes so panning/zoom syncs across channels
+        if i > 0:
+            pw.setXLink(eeg_plots[0])
+
+        curve = pw.plot()
+        eeg_plots.append(pw)
+        eeg_curves.append(curve)
+        eeg_layout.addWidget(pw)
+
+    eeg_container.setLayout(eeg_layout)
+    scroll.setWidget(eeg_container)
+
+    # Add scroll area to main layout
+    main_layout.addWidget(scroll, stretch=3)
+
+    # --- Bandpower plot at the bottom ---
+    band_plot = pg.PlotWidget(title="Bandpower Time Series")
     band_plot.setLabel('bottom', 'Time', units='s')
-    band_plot.setLabel('left', 'Power (a.u.)')
+    band_plot.setLabel('left', 'Power', units='a.u.')
 
     band_names = ["Delta", "Theta", "Alpha", "Beta", "Gamma"]
     band_curves = []
@@ -120,7 +150,12 @@ def main():
     band_history = [[] for _ in band_names]
     t0 = time.time()
 
-    win.show()
+    main_layout.addWidget(band_plot, stretch=1)
+
+    main_win.setLayout(main_layout)
+    main_win.resize(900, 700)
+    main_win.show()
+
 
     try:
         while True:
@@ -138,19 +173,22 @@ def main():
                 print("Not enough data yet, waiting...")
                 continue
 
-            # ---- EEG time-series plot ----
+            # ---- EEG: per-channel plots ----
             eeg_window = data[eeg_channels, :]  # shape: (n_channels, num_samples)
             t_eeg = np.linspace(-window_sec, 0, num_samples)
-            for i, curve in enumerate(eeg_curves):
-                if i < eeg_window.shape[0]:
-                    curve.setData(t_eeg, eeg_window[i, :])
 
-            y_min = float(np.min(eeg_window))
-            y_max = float(np.max(eeg_window))
-            if y_min == y_max:
-                y_min -= 1.0
-                y_max += 1.0
-            eeg_plot.setYRange(y_min, y_max)
+            for ch_idx, curve in enumerate(eeg_curves):
+                if ch_idx < eeg_window.shape[0]:
+                    chan_data = eeg_window[ch_idx, :]
+                    curve.setData(t_eeg, chan_data)
+
+                    # auto-scale Y for each individual channel plot
+                    y_min = float(np.min(chan_data))
+                    y_max = float(np.max(chan_data))
+                    if y_min == y_max:
+                        y_min -= 1.0
+                        y_max += 1.0
+                    eeg_plots[ch_idx].setYRange(y_min, y_max)
 
             # ---- band powers ----
             bands = DataFilter.get_avg_band_powers(
