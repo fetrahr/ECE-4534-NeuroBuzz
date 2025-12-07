@@ -12,6 +12,7 @@ from brainflow.ml_model import (
 
 import numpy as np
 import pyqtgraph as pg
+from pyqtgraph.Qt import QtCore, QtWidgets
 
 
 def main():
@@ -51,9 +52,12 @@ def main():
 
     board.prepare_session()
     board.start_stream(45000, args.streamer_params)
-    BoardShim.log_message(LogLevels.LEVEL_INFO.value,
-                          'Start continuous EEG metric loop (synthetic board)')
-    print("Running real-time EEG + bandpower viewer with SYNTHETIC_BOARD. Ctrl+C to exit.\n")
+    BoardShim.log_message(
+        LogLevels.LEVEL_INFO.value,
+        'Start continuous EEG metric loop (synthetic board)'
+    )
+    print("Running real-time EEG + bandpower viewer with SYNTHETIC_BOARD. "
+          "Close the window or Ctrl+C in terminal to exit.\n")
 
     # --- ML models ---
     mindfulness_params = BrainFlowModelParams(
@@ -76,10 +80,11 @@ def main():
     eeg_channels = BoardShim.get_eeg_channels(int(master_board_id))
     n_ch = len(eeg_channels)
 
+    # Window length for analysis (seconds) and number of samples per window
     window_sec = 4.0
     num_samples = int(window_sec * sampling_rate)
 
-    # ---------- pyqtgraph setup ----------
+    # ---------- pyqtgraph / Qt setup ----------
     app = pg.mkQApp("EEG + Bandpower Viewer")
     win = pg.GraphicsLayoutWidget(title="EEG + Bandpower (Synthetic Board)")
     win.resize(1000, 800)
@@ -90,7 +95,7 @@ def main():
     eeg_plot.getAxis('left').setTicks([])  # no y ticks
     eeg_plot.showGrid(x=True, y=True, alpha=0.2)
 
-    spacing = 100.0  # vertical spacing between channels
+    spacing = 100.0  # vertical spacing between channels in display units
 
     eeg_curves = []
     channel_labels = []
@@ -102,9 +107,21 @@ def main():
         curve = eeg_plot.plot(pen=pen)
         eeg_curves.append(curve)
 
-        label = pg.TextItem(f"Ch {ch}", color=pen, anchor=(1, 0.5))
+        label = pg.TextItem(f"Ch {ch}", color=pen, anchor=(0, 0.5))  # left-middle anchor
         eeg_plot.addItem(label)
         channel_labels.append(label)
+
+    rms_labels = []
+    for i in range(n_ch):
+        # empty text for now; white text, right-anchored, with semi-transparent background
+        rms_label = pg.TextItem(
+            "",                       # text set in update()
+            color='w',
+            anchor=(1, 0.5),          # right-middle anchor
+            fill=pg.mkBrush(0, 0, 0, 180)  # black-ish background for box effect
+        )
+        eeg_plot.addItem(rms_label)
+        rms_labels.append(rms_label)
 
     eeg_plot.setYRange(-spacing, spacing * (n_ch + 1))
 
@@ -113,6 +130,11 @@ def main():
     band_plot.setLabel('bottom', 'Time', units='s')
     band_plot.setLabel('left', 'Power', units='a.u.')
     band_plot.showGrid(x=True, y=True, alpha=0.2)
+    
+    # --- make left axes the same width so x-axes line up ---
+    left_axis_width = 60  # tweak this until it looks nice
+    eeg_plot.getAxis('left').setWidth(left_axis_width)
+    band_plot.getAxis('left').setWidth(left_axis_width)
 
     band_info = [
         ("Delta", "1–4 Hz"),
@@ -135,81 +157,117 @@ def main():
     band_window_sec = 4.0
     t0 = time.time()
 
+    # --- timing / update configuration ---
+    update_speed_ms = 50          # how often to refresh plots (20 Hz)
+    metrics_period = 1.0          # how often to recompute metrics/print
+    last_metrics_time = time.time()
+
     win.show()
 
+    # ---------- update function called by QTimer ----------
+    def update():
+        nonlocal last_metrics_time
+
+        # get the most recent window of data
+        data = board.get_current_board_data(num_samples)
+
+        # skip if not enough data yet
+        if data.shape[1] < num_samples:
+            return
+
+        # ========== EEG update (every timer tick) ==========
+        eeg_window = data[eeg_channels, :]  # shape: (n_ch, num_samples)
+        t_eeg = np.linspace(-window_sec, 0, num_samples)
+
+        max_abs = float(np.max(np.abs(eeg_window))) if eeg_window.size > 0 else 1.0
+        if max_abs < 1e-6:
+            max_abs = 1.0
+        # scale to fit within strip spacing
+        scale = 0.4 * spacing / max_abs
+
+        # Get current view range, so labels/boxes track the visible area
+        vb = eeg_plot.getViewBox()
+        x_min, x_max = vb.viewRange()[0]
+        x_left  = x_min + 0.02 * (x_max - x_min)   # 2% in from left for channel labels
+        x_right = x_max - 0.02 * (x_max - x_min)   # 2% in from right for RMS boxes
+
+        for idx, curve in enumerate(eeg_curves):
+            if idx < eeg_window.shape[0]:
+                # raw channel data for RMS (in whatever units BrainFlow gives, usually µV)
+                raw_chan = eeg_window[idx, :].astype(float)
+
+                # draw signal (detrended + scaled + offset)
+                sig = raw_chan - np.mean(raw_chan)
+                sig = sig * scale
+
+                offset = (n_ch - 1 - idx) * spacing
+                curve.setData(t_eeg, sig + offset)
+
+                # --- left-side channel name label ---
+                channel_labels[idx].setPos(x_left, offset)
+
+                # --- right-side RMS "box" ---
+                # RMS of detrended signal in original units
+                rms_val = np.sqrt(np.mean(raw_chan**2))
+                rms_labels[idx].setPos(x_right, offset)
+                rms_labels[idx].setText(f"{rms_val:5.1f} µV")
+
+        eeg_plot.setXRange(-window_sec, 0.0, padding=0)
+
+
+
+        # ========== Bandpower update (EVERY frame) ==========
+        now = time.time()
+        bands = DataFilter.get_avg_band_powers(
+            data, eeg_channels, sampling_rate, True
+        )
+        feature_vector = bands[0]  # delta, theta, alpha, beta, gamma
+
+        t_now = now - t0
+        band_times.append(t_now)
+
+        fv = np.asarray(feature_vector).flatten()
+
+        # compute relative times for plotting (seconds from "now")
+        band_times_rel = [t - t_now for t in band_times]  # will be ..., -3.8, -3.7, ..., 0
+
+        for i, curve in enumerate(band_curves):
+            if i < len(fv):
+                band_history[i].append(float(fv[i]))
+                # plot using relative times, but keep underlying band_times untouched
+                curve.setData(band_times_rel, band_history[i])
+
+        # visually show only -4 .. 0 on the x-axis
+        band_window_sec = 4.0
+        band_plot.setXRange(-band_window_sec, 0.0, padding=0)
+
+        # ========== Metrics update (slower rate) ==========
+        if now - last_metrics_time < metrics_period:
+            return
+
+        last_metrics_time = now
+
+        mindfulness_score = float(mindfulness.predict(feature_vector)[0])
+        restfulness_score = float(restfulness.predict(feature_vector)[0])
+
+        mindfulness_detected = mindfulness_score >= MINDFULNESS_THRESHOLD
+        restfulness_detected = restfulness_score >= RESTFULNESS_THRESHOLD
+
+        print(
+            f"Mindfulness: {mindfulness_score:.3f} "
+            f"(detected={mindfulness_detected}), "
+            f"Restfulness: {restfulness_score:.3f} "
+            f"(detected={restfulness_detected})"
+        )
+        print()
+
+    # ---------- QTimer driving the update loop ----------
+    timer = QtCore.QTimer()
+    timer.timeout.connect(update)
+    timer.start(update_speed_ms)
+
     try:
-        while True:
-            # keep Qt GUI responsive
-            app.processEvents()
-
-            # let the buffer fill enough for one window
-            time.sleep(window_sec)
-
-            # get the most recent window of data
-            data = board.get_current_board_data(num_samples)
-
-            # skip if not enough data yet
-            if data.shape[1] < num_samples:
-                print("Not enough data yet, waiting...")
-                continue
-
-            # ========== EEG update ==========
-            eeg_window = data[eeg_channels, :]  # shape: (n_ch, num_samples)
-            t_eeg = np.linspace(-window_sec, 0, num_samples)
-
-            max_abs = float(np.max(np.abs(eeg_window))) if eeg_window.size > 0 else 1.0
-            if max_abs < 1e-6:
-                max_abs = 1.0
-            scale = 0.4 * spacing / max_abs  # scale to fit within strips
-
-            for idx, curve in enumerate(eeg_curves):
-                if idx < eeg_window.shape[0]:
-                    sig = eeg_window[idx, :].astype(float)
-                    sig = sig - np.mean(sig)
-                    sig = sig * scale
-
-                    offset = (n_ch - 1 - idx) * spacing
-                    curve.setData(t_eeg, sig + offset)
-
-                    channel_labels[idx].setPos(t_eeg[0], offset)
-
-            eeg_plot.setXRange(-window_sec, 0.0, padding=0)
-
-            # ========== Bandpower update ==========
-            bands = DataFilter.get_avg_band_powers(
-                data, eeg_channels, sampling_rate, True
-            )
-            feature_vector = bands[0]  # delta, theta, alpha, beta, gamma
-
-            t_now = time.time() - t0
-            band_times.append(t_now)
-
-            fv = np.asarray(feature_vector).flatten()
-            for i in range(len(band_info)):
-                if i < len(fv):
-                    band_history[i].append(float(fv[i]))
-                    band_curves[i].setData(band_times, band_history[i])
-
-            band_plot.setXRange(t_now - band_window_sec, t_now, padding=0)
-
-            # ========== Metrics update ==========
-            mindfulness_score = float(mindfulness.predict(feature_vector)[0])
-            restfulness_score = float(restfulness.predict(feature_vector)[0])
-
-            mindfulness_detected = mindfulness_score >= MINDFULNESS_THRESHOLD
-            restfulness_detected = restfulness_score >= RESTFULNESS_THRESHOLD
-
-            print(
-                f"Mindfulness: {mindfulness_score:.3f} "
-                f"(detected={mindfulness_detected}), "
-                f"Restfulness: {restfulness_score:.3f} "
-                f"(detected={restfulness_detected})"
-            )
-            print()
-
-    except KeyboardInterrupt:
-        print("Stopping on user interrupt...")
-
+        QtWidgets.QApplication.instance().exec()
     finally:
         board.stop_stream()
         board.release_session()
