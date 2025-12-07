@@ -1,390 +1,34 @@
 import argparse
 import time
 import sys
-import select
 
 from brainflow.board_shim import BoardShim, BrainFlowInputParams, LogLevels, BoardIds
 from brainflow.data_filter import DataFilter
 from brainflow.ml_model import MLModel, BrainFlowMetrics, BrainFlowClassifiers, BrainFlowModelParams
 
-# ---------- Motor / I2C imports ----------
-import board
-import busio
-from adafruit_bus_device.i2c_device import I2CDevice
-import adafruit_drv2605
-
 import numpy as np
-import matplotlib.pyplot as plt
+import pyqtgraph as pg
 
-# ---------- Motor Config ----------
-MUX_ADDR = 0x70
-CHANNELS = [0, 1, 2]      # 3 motors on mux channels 0,1,2
-USE_LRA = True            # True for LRA, False for ERM
-LRA_LIBRARY = 6           # 6 for LRA, 1 for ERM
-MAX_EFFECT = 123          # DRV2605 effect range 1..123
-DEFAULT_EFFECT = 120        # simple click / buzz pattern
-
-class RealTimePlotter:
-    """
-    Real-time plots:
-      - Top: EEG time series (last window for each EEG channel)
-      - Bottom: bandpower time series for each brainwave band
-    """
-    def __init__(self, eeg_channels, sampling_rate, window_sec):
-        self.eeg_channels = eeg_channels
-        self.sampling_rate = sampling_rate
-        self.window_sec = window_sec
-
-        self.n_eeg_channels = len(eeg_channels)
-        self.n_samples = int(window_sec * sampling_rate)
-
-        # Time axis for EEG window: e.g. from -4 to 0 seconds
-        self.t_eeg = np.linspace(-window_sec, 0, self.n_samples)
-
-        # Band names in BrainFlow's order (delta, theta, alpha, beta, gamma)
-        self.band_names = ["Delta", "Theta", "Alpha", "Beta", "Gamma"]
-        self.n_bands = len(self.band_names)
-
-        # History for band powers
-        self.band_times = []
-        self.band_history = [[] for _ in range(self.n_bands)]
-
-        # Set up figure
-        plt.ion()
-        self.fig, (self.ax_eeg, self.ax_band) = plt.subplots(2, 1, figsize=(10, 7))
-
-        # EEG lines
-        self.eeg_lines = []
-        for i, ch in enumerate(self.eeg_channels):
-            line, = self.ax_eeg.plot([], [], label=f"Ch {ch}")
-            self.eeg_lines.append(line)
-
-        self.ax_eeg.set_title("EEG Time Series (last window)")
-        self.ax_eeg.set_xlabel("Time (s)")
-        self.ax_eeg.set_ylabel("Amplitude (µV)")
-        self.ax_eeg.legend(loc="upper right")
-
-        # Bandpower lines
-        self.band_lines = []
-        for i, name in enumerate(self.band_names):
-            line, = self.ax_band.plot([], [], label=name)
-            self.band_lines.append(line)
-
-        self.ax_band.set_title("Bandpower Time Series")
-        self.ax_band.set_xlabel("Time (s)")
-        self.ax_band.set_ylabel("Power (a.u.)")
-        self.ax_band.legend(loc="upper right")
-
-        self.start_time = time.time()
-
-    def update_eeg(self, eeg_window):
-        """
-        eeg_window: shape (n_eeg_channels, n_samples)
-        Plots last window_sec of EEG data.
-        """
-        if eeg_window.shape[1] != self.n_samples:
-            # Recompute time vector just in case
-            self.n_samples = eeg_window.shape[1]
-            self.t_eeg = np.linspace(-self.window_sec, 0, self.n_samples)
-
-        # Update each channel line
-        for i, line in enumerate(self.eeg_lines):
-            if i < eeg_window.shape[0]:
-                line.set_data(self.t_eeg, eeg_window[i, :])
-
-        # Adjust axes
-        self.ax_eeg.set_xlim(self.t_eeg[0], self.t_eeg[-1])
-        y_min = float(np.min(eeg_window))
-        y_max = float(np.max(eeg_window))
-        if y_min == y_max:
-            y_min -= 1.0
-            y_max += 1.0
-        self.ax_eeg.set_ylim(y_min, y_max)
-
-    def update_bands(self, band_powers):
-        """
-        band_powers: 1D array-like of length 5 (delta..gamma)
-        Appends a new timepoint and updates bandpower traces.
-        """
-        t = time.time() - self.start_time
-        self.band_times.append(t)
-
-        # Ensure band_powers is a flat array
-        band_powers = np.asarray(band_powers).flatten()
-
-        for i in range(self.n_bands):
-            if i < len(band_powers):
-                self.band_history[i].append(float(band_powers[i]))
-                self.band_lines[i].set_data(self.band_times, self.band_history[i])
-
-        self.ax_band.relim()
-        self.ax_band.autoscale_view()
-
-    def refresh(self):
-        """Redraw the figure without blocking."""
-        self.fig.canvas.draw_idle()
-        plt.pause(0.001)
-
-
-# ---------- I2C + MUX ----------
-i2c = busio.I2C(board.SCL, board.SDA)
-
-def tca_select(ch: int):
-    """Select TCA9548A mux channel."""
-    with I2CDevice(i2c, MUX_ADDR) as mux:
-        mux.write(bytes([1 << ch]))
-    time.sleep(0.002)
-
-def make_drv_for_channel(ch: int, use_lra: bool, lib: int):
-    """Create and configure a DRV2605 instance for a mux channel."""
-    tca_select(ch)
-    drv = adafruit_drv2605.DRV2605(i2c)
-    if use_lra:
-        drv.use_LRM()
-        drv.library = lib
-    else:
-        drv.use_ERM()
-        drv.library = 1
-    return drv
-
-drivers = [make_drv_for_channel(ch, USE_LRA, LRA_LIBRARY) for ch in CHANNELS]
-
-def trigger_single_motor(motor_index: int, effect: int = DEFAULT_EFFECT):
-    """
-    Trigger a single motor by index (0,1,2).
-    Uses sequence[0] with a single effect and calls play().
-    """
-    if not (0 <= motor_index < len(drivers)):
-        return
-    ch = CHANNELS[motor_index]
-    drv = drivers[motor_index]
-    tca_select(ch)
-    drv.sequence[0] = adafruit_drv2605.Effect(effect)
-    drv.play()
-
-def run_motor_pattern(mindfulness_detected: bool,
-                      restfulness_detected: bool,
-                      motors_enabled: bool):
-    """
-    Map EEG metrics → motor patterns:
-
-      - Mindfulness only  (True, False):
-          buzz left->right
-
-      - Restfulness only (False, True):
-          buzz right->left
-
-      - Neither or both (False, False) or (True, True):
-          all motors buzz once (periodic "baseline" buzz)
-    """
-    if not motors_enabled:
-        return
-
-    # Mindfulness only: left -> right
-    if mindfulness_detected and not restfulness_detected:
-        for idx in CHANNELS:
-            trigger_single_motor(idx)
-            time.sleep(0.5)  # step timing between motors
-        return
-
-    # Restfulness only: right -> left
-    if restfulness_detected and not mindfulness_detected:
-        for idx in CHANNELS:
-            trigger_single_motor(idx)
-            time.sleep(0.5)
-        return
-
-    # Neither (or both) detected: buzz all motors once (periodic)
-    for idx in CHANNELS:
-        trigger_single_motor(idx)
-
-def stop_all_motors():
-    """Stop all DRV2605 outputs (best-effort)."""
-    for ch, drv in zip(CHANNELS, drivers):
-        try:
-            tca_select(ch)
-            drv.stop()
-        except Exception:
-            pass
-
-def check_for_input(motors_enabled: bool):
-    """
-    Non-blocking check for user commands from stdin.
-
-    - 's' + Enter: toggle motors on/off
-    - 'r' + Enter: start record/playback sequence
-
-    Returns: (motors_enabled, record_requested)
-    """
-    record_requested = False
-    rlist, _, _ = select.select([sys.stdin], [], [], 0)
-    if sys.stdin in rlist:
-        line = sys.stdin.readline().strip().lower()
-        if line == 's':
-            motors_enabled = not motors_enabled
-            state = "ENABLED" if motors_enabled else "DISABLED"
-            print(f"[motors] {state}")
-        elif line == 'r':
-            record_requested = True
-    return motors_enabled, record_requested
-
-def collect_segment(board, duration_s, sampling_rate, with_stim=False):
+def collect_segment(board, duration_s, sampling_rate):
     """
     Collect 'duration_s' seconds of data from the board.
-
-    If with_stim is True, continuously run a simple stimulation pattern
-    (buzz all three motors sequentially) during the segment.
     """
     collected = []
     t_start = time.time()
 
     while time.time() - t_start < duration_s:
-        if with_stim:
-            # simple pattern: left->right each loop
-            for idx in [0, 1, 2]:
-                trigger_single_motor(idx)
-                time.sleep(0.05)
-
-        # read whatever data accumulated since last call
         chunk = board.get_board_data()
         if chunk.size > 0:
             collected.append(chunk)
-
-        # small sleep to avoid busy-waiting
         time.sleep(0.05)
 
     if collected:
         data = np.concatenate(collected, axis=1)
     else:
-        # Fallback: grab last N samples if nothing collected for some reason
         n_samples = int(duration_s * sampling_rate)
         data = board.get_current_board_data(n_samples)
     return data
 
-def run_record_playback(board, eeg_channels, sampling_rate,
-                        mindfulness_model, restfulness_model):
-    """
-    Implements your 'r' mode:
-
-      - Print explanation
-      - Wait for Enter
-      - 10s baseline (no stim)
-      - 10s stimulation (motors buzzing)
-      - FFT plots (baseline vs stim)
-      - Metrics plots (mindfulness/restfulness baseline vs stim)
-      - Save all data to file
-    """
-    print("\n=== Record / Playback Mode ===")
-    print("This mode will:")
-    print("  1) Record 10 seconds of EEG with NO motor stimulation.")
-    print("  2) Then record 10 seconds of EEG WITH motor stimulation.")
-    print("  3) Show FFT plots comparing both segments.")
-    print("  4) Show mindfulness/restfulness scores for both segments.")
-    print("  5) Save the recorded data and metrics to a file.\n")
-    input("Press Enter to start the 10-second baseline (no motors)...")
-
-    # Clear any old data from the buffer so we get clean segments
-    _ = board.get_board_data()
-
-    # 1) Baseline segment (no motors)
-    print("Recording baseline (no motor stimulation) for 10 seconds...")
-    stop_all_motors()
-    baseline_data = collect_segment(board, duration_s=10,
-                                    sampling_rate=sampling_rate,
-                                    with_stim=False)
-    print("Baseline recording done.\n")
-
-    # 2) Stimulation segment
-    input("Press Enter to start 10-second stimulation segment...")
-    print("Recording with motor stimulation for 10 seconds...")
-    # Motors are driven inside collect_segment(with_stim=True)
-    stim_data = collect_segment(board, duration_s=10,
-                                sampling_rate=sampling_rate,
-                                with_stim=True)
-    stop_all_motors()
-    print("Stimulation recording done.\n")
-
-    # ---------- Compute FFTs ----------
-    # Use mean across EEG channels for a simple 1D signal per segment
-    baseline_eeg = baseline_data[eeg_channels, :]
-    stim_eeg = stim_data[eeg_channels, :]
-
-    baseline_signal = baseline_eeg.mean(axis=0)
-    stim_signal = stim_eeg.mean(axis=0)
-
-    # FFT
-    def compute_fft(sig, fs):
-        n = len(sig)
-        freqs = np.fft.rfftfreq(n, d=1.0 / fs)
-        spectrum = np.abs(np.fft.rfft(sig))
-        return freqs, spectrum
-
-    freqs_b, spec_b = compute_fft(baseline_signal, sampling_rate)
-    freqs_s, spec_s = compute_fft(stim_signal, sampling_rate)
-
-    # ---------- Compute metrics ----------
-    def compute_metrics(segment):
-        bands = DataFilter.get_avg_band_powers(segment, eeg_channels,
-                                               sampling_rate, True)
-        feature_vector = bands[0]
-        m_score = float(mindfulness_model.predict(feature_vector)[0])
-        r_score = float(restfulness_model.predict(feature_vector)[0])
-        return m_score, r_score
-
-    m_base, r_base = compute_metrics(baseline_data)
-    m_stim, r_stim = compute_metrics(stim_data)
-
-    print(f"Baseline Mindfulness:  {m_base:.3f}, Restfulness: {r_base:.3f}")
-    print(f"Stim Mindfulness:      {m_stim:.3f}, Restfulness: {r_stim:.3f}\n")
-
-    # ---------- Plot FFTs ----------
-    plt.figure(figsize=(10, 6))
-    plt.subplot(2, 1, 1)
-    plt.title("FFT - Baseline (no stimulation)")
-    plt.plot(freqs_b, spec_b)
-    plt.xlabel("Frequency (Hz)")
-    plt.ylabel("Magnitude")
-
-    plt.subplot(2, 1, 2)
-    plt.title("FFT - Stimulation")
-    plt.plot(freqs_s, spec_s)
-    plt.xlabel("Frequency (Hz)")
-    plt.ylabel("Magnitude")
-    plt.tight_layout()
-
-    # ---------- Plot metrics ----------
-    labels = ["Baseline", "Stim"]
-    x = np.arange(len(labels))
-
-    plt.figure(figsize=(8, 5))
-    width = 0.35
-
-    plt.bar(x - width/2, [m_base, m_stim], width, label="Mindfulness")
-    plt.bar(x + width/2, [r_base, r_stim], width, label="Restfulness")
-
-    plt.xticks(x, labels)
-    plt.ylabel("Score")
-    plt.title("Mindfulness / Restfulness: Baseline vs Stim")
-    plt.legend()
-    plt.tight_layout()
-
-    plt.show()
-
-    # ---------- Save data ----------
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    filename = f"eeg_record_playback_{timestamp}.npz"
-    np.savez(
-        filename,
-        baseline=baseline_data,
-        stim=stim_data,
-        sampling_rate=sampling_rate,
-        eeg_channels=np.array(eeg_channels),
-        baseline_mindfulness=m_base,
-        baseline_restfulness=r_base,
-        stim_mindfulness=m_stim,
-        stim_restfulness=r_stim,
-    )
-    print(f"[saved] Record/playback data saved to {filename}\n")
 
 def main():
     BoardShim.enable_board_logger()
@@ -392,27 +36,21 @@ def main():
     MLModel.enable_ml_logger()
 
     parser = argparse.ArgumentParser()
-    # use docs to check which parameters are required for specific board, e.g. for Cyton - set serial port
-    parser.add_argument('--timeout', type=int, help='timeout for device discovery or connection', required=False,
-                        default=0)
-    parser.add_argument('--ip-port', type=int, help='ip port', required=False, default=0)
-    parser.add_argument('--ip-protocol', type=int, help='ip protocol, check IpProtocolType enum', required=False,
-                        default=0)
-    parser.add_argument('--ip-address', type=str, help='ip address', required=False, default='')
-    parser.add_argument('--serial-port', type=str, help='serial port', required=False, default='')
-    parser.add_argument('--mac-address', type=str, help='mac address', required=False, default='')
-    parser.add_argument('--other-info', type=str, help='other info', required=False, default='')
-    parser.add_argument('--streamer-params', type=str, help='streamer params', required=False, default='')
-    parser.add_argument('--serial-number', type=str, help='serial number', required=False, default='')
-    #parser.add_argument('--board-id', type=int, help='board id, check docs to get a list of supported boards',
-    #
-    #                     required=True)
-    parser.add_argument('--file', type=str, help='file', required=False, default='')
+    parser.add_argument('--timeout', type=int, required=False, default=0)
+    parser.add_argument('--ip-port', type=int, required=False, default=0)
+    parser.add_argument('--ip-protocol', type=int, required=False, default=0)
+    parser.add_argument('--ip-address', type=str, required=False, default='')
+    parser.add_argument('--serial-port', type=str, required=False, default='')
+    parser.add_argument('--mac-address', type=str, required=False, default='')
+    parser.add_argument('--other-info', type=str, required=False, default='')
+    parser.add_argument('--streamer-params', type=str, required=False, default='')
+    parser.add_argument('--serial-number', type=str, required=False, default='')
+    parser.add_argument('--file', type=str, required=False, default='')
     args = parser.parse_args()
 
     params = BrainFlowInputParams()
     params.ip_port = args.ip_port
-    params.serial_port = '/dev/ttyUSB0'
+    params.serial_port = '/dev/ttyUSB0'  # hard-coded for your setup
     params.mac_address = args.mac_address
     params.other_info = args.other_info
     params.serial_number = args.serial_number
@@ -425,50 +63,69 @@ def main():
     master_board_id = board.get_board_id()
     sampling_rate = BoardShim.get_sampling_rate(master_board_id)
 
-
     board.prepare_session()
     board.start_stream(45000, args.streamer_params)
     BoardShim.log_message(LogLevels.LEVEL_INFO.value, 'Start continuous EEG metric loop')
-    print("Controls:")
-    print("  s + Enter  -> toggle motors on/off")
-    print("  r + Enter  -> record/playback mode (10s baseline + 10s stim)")
-    print("  Ctrl+C     -> exit\n")
-    
-    mindfulness_params = BrainFlowModelParams(BrainFlowMetrics.MINDFULNESS.value,
-                                              BrainFlowClassifiers.DEFAULT_CLASSIFIER.value)
+    print("Running real-time EEG + bandpower viewer. Ctrl+C to exit.\n")
+
+    mindfulness_params = BrainFlowModelParams(
+        BrainFlowMetrics.MINDFULNESS.value,
+        BrainFlowClassifiers.DEFAULT_CLASSIFIER.value
+    )
     mindfulness = MLModel(mindfulness_params)
     mindfulness.prepare()
-    
-    restfulness_params = BrainFlowModelParams(BrainFlowMetrics.RESTFULNESS.value,
-                                              BrainFlowClassifiers.DEFAULT_CLASSIFIER.value)
+
+    restfulness_params = BrainFlowModelParams(
+        BrainFlowMetrics.RESTFULNESS.value,
+        BrainFlowClassifiers.DEFAULT_CLASSIFIER.value
+    )
     restfulness = MLModel(restfulness_params)
     restfulness.prepare()
-    
+
     MINDFULNESS_THRESHOLD = 0.7
     RESTFULNESS_THRESHOLD = 0.7
 
     eeg_channels = BoardShim.get_eeg_channels(int(master_board_id))
-    
+
     window_sec = 4
     num_samples = int(window_sec * sampling_rate)
 
-    # Real-time plots
-    plotter = RealTimePlotter(eeg_channels, sampling_rate, window_sec)
+    # ---------- pyqtgraph setup ----------
+    app = pg.mkQApp("EEG + Bandpower Viewer")
+    win = pg.GraphicsLayoutWidget(title="EEG + Bandpower")
+    win.resize(900, 700)
 
+    # Top: EEG time series
+    eeg_plot = win.addPlot(row=0, col=0, title="EEG Time Series (last window)")
+    eeg_plot.setLabel('bottom', 'Time', units='s')
+    eeg_plot.setLabel('left', 'Amplitude', units='µV')
 
-    motors_enabled = True
+    eeg_curves = []
+    for i, ch in enumerate(eeg_channels):
+        curve = eeg_plot.plot(pen=i, name=f"Ch {ch}")
+        eeg_curves.append(curve)
+
+    # Bottom: Bandpower time series
+    band_plot = win.addPlot(row=1, col=0, title="Bandpower Time Series")
+    band_plot.setLabel('bottom', 'Time', units='s')
+    band_plot.setLabel('left', 'Power (a.u.)')
+
+    band_names = ["Delta", "Theta", "Alpha", "Beta", "Gamma"]
+    band_curves = []
+    for i, name in enumerate(band_names):
+        curve = band_plot.plot(pen=i, name=name)
+        band_curves.append(curve)
+
+    band_times = []
+    band_history = [[] for _ in band_names]
+    t0 = time.time()
+
+    win.show()
 
     try:
         while True:
-            # Handle user input (s / r) without blocking
-            motors_enabled, record_requested = check_for_input(motors_enabled)
-
-            if record_requested:
-                # Run the 20s record/playback experiment
-                run_record_playback(board, eeg_channels, sampling_rate,
-                                    mindfulness, restfulness)
-                # After that, continue normal loop
-                continue
+            # keep Qt GUI responsive
+            app.processEvents()
 
             # let the buffer fill enough for one window
             time.sleep(window_sec)
@@ -481,17 +138,35 @@ def main():
                 print("Not enough data yet, waiting...")
                 continue
 
-            # ---- update EEG time-series plot (last window) ----
+            # ---- EEG time-series plot ----
             eeg_window = data[eeg_channels, :]  # shape: (n_channels, num_samples)
-            plotter.update_eeg(eeg_window)
+            t_eeg = np.linspace(-window_sec, 0, num_samples)
+            for i, curve in enumerate(eeg_curves):
+                if i < eeg_window.shape[0]:
+                    curve.setData(t_eeg, eeg_window[i, :])
 
-            # compute band powers and feature vector
+            y_min = float(np.min(eeg_window))
+            y_max = float(np.max(eeg_window))
+            if y_min == y_max:
+                y_min -= 1.0
+                y_max += 1.0
+            eeg_plot.setYRange(y_min, y_max)
+
+            # ---- band powers ----
             bands = DataFilter.get_avg_band_powers(
                 data, eeg_channels, sampling_rate, True
             )
-            feature_vector = bands[0]
+            feature_vector = bands[0]  # delta, theta, alpha, beta, gamma
 
-            # compute metrics (each is a 1-element array -> take [0] and cast to float)
+            t_now = time.time() - t0
+            band_times.append(t_now)
+            fv = np.asarray(feature_vector).flatten()
+            for i in range(len(band_names)):
+                if i < len(fv):
+                    band_history[i].append(float(fv[i]))
+                    band_curves[i].setData(band_times, band_history[i])
+
+            # ---- metrics ----
             mindfulness_score = float(mindfulness.predict(feature_vector)[0])
             restfulness_score = float(restfulness.predict(feature_vector)[0])
 
@@ -504,28 +179,16 @@ def main():
                 f"Restfulness: {restfulness_score:.3f} "
                 f"(detected={restfulness_detected})"
             )
-            print()  # blank line between updates
-
-            # ---- drive motor pattern based on metrics ----
-            run_motor_pattern(
-                mindfulness_detected,
-                restfulness_detected,
-                motors_enabled
-            )
+            print()
 
     except KeyboardInterrupt:
         print("Stopping on user interrupt...")
 
     finally:
-        # clean up
         board.stop_stream()
         board.release_session()
         mindfulness.release()
         restfulness.release()
-
-        # stop motors on exit
-        stop_all_motors()
-
 
 
 if __name__ == "__main__":
