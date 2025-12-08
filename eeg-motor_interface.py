@@ -1,360 +1,474 @@
-#!/usr/bin/env python3
-"""
-EEG → Haptics interface using BrainFlow predefined metrics (RELAXATION, CONCENTRATION, STRESS).
-
-- Streams EEG from an OpenBCI (or any BrainFlow-supported) board
-- Computes BrainFlow metrics on a rolling window
-- Maps metric scores to motor commands (intensity / pattern)
-- I2C motor control is intentionally NOT implemented — clearly-marked stubs are provided
-"""
-from __future__ import annotations
 import argparse
-import signal
-import sys
 import time
-import threading
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
+import csv
+import os
+from datetime import datetime
 
-import numpy as np
-
-from brainflow.board_shim import BoardShim, BrainFlowInputParams, BoardIds
-from brainflow.data_filter import DataFilter, FilterTypes, DetrendOperations
+from brainflow.board_shim import BoardShim, BrainFlowInputParams, LogLevels, BoardIds
+from brainflow.data_filter import DataFilter
 from brainflow.ml_model import (
     MLModel,
-    BrainFlowModelParams,
     BrainFlowMetrics,
     BrainFlowClassifiers,
+    BrainFlowModelParams,
 )
 
-
-# =========================
-# Configuration
-# =========================
-@dataclass
-class Config:
-    board_id: int = BoardIds.CYTON_BOARD.value  # Change if not using Cyton
-    sampling_rate: int = 250                    # Cyton default
-    window_sec: float = 4.0                     # seconds of data per inference
-    step_sec: float = 1.0                       # inference cadence
-    bandpass_low: float = 1.0                   # Hz
-    bandpass_high: float = 40.0                 # Hz
-    notch: float = 60.0                         # set to 50.0 in EU
-
-    # Channels of interest (override after connecting using BoardShim.get_eeg_channels)
-    eeg_channels: List[int] | None = None
-
-    # Metric thresholds (tune!)
-    relax_low: float = 0.40
-    relax_high: float = 0.70
-    focus_low: float = 0.40
-    focus_high: float = 0.70
-    stress_low: float = 0.30
-    stress_high: float = 0.60
-
-    # I2C / DRV2605L placeholders — fill in when you wire hardware
-    i2c_bus: int = 1
-    drv2605l_addresses: List[int] = None  # e.g., [0x5A, 0x5B, 0x5C]
-    use_i2c_mux: bool = False
-    i2c_mux_address: int = 0x70  # Common TCA9548A address
+import numpy as np
+import pyqtgraph as pg
+from pyqtgraph.Qt import QtCore, QtWidgets
 
 
-# =========================
-# I2C STUBS (fill in later)
-# =========================
-class HapticsDriver:
-    """Placeholder for DRV2605L (or similar) control over I2C.
-
-    Replace STUB sections with your actual I2C implementation.
-    Suggested Python libs: `smbus2` or `periphery` on Raspberry Pi.
+class EEGLogger:
     """
+    Logs two CSV files:
 
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-        # STUB: Initialize I2C bus, mux, and drivers here
-        # Example:
-        #   from smbus2 import SMBus
-        #   self.bus = SMBus(cfg.i2c_bus)
-        #   if cfg.use_i2c_mux: self._select_mux_channel(0)
-        pass
+      1) Raw samples (eeg_raw_*.csv):
+         brainflow_ts, ch_<id>...
 
-    def close(self):
-        # STUB: Close I2C resources if needed
-        pass
+      2) Features (eeg_features_*.csv):
+         brainflow_ts, delta, theta, alpha, beta, gamma,
+         mindfulness_score, restfulness_score,
+         mindfulness_detected, restfulness_detected
 
-    def set_global_intensity(self, intensity: int):
-        """Set overall vibration intensity 0..100.
-        Map this to DRV2605L real registers when you implement.
+    Usage:
+        logger = EEGLogger()
+        logger.start(eeg_channels)
+        ...
+        logger.log_raw(data, ts_idx, eeg_channels)
+        logger.log_features(ts, bands, mind, rest, mind_det, rest_det)
+        ...
+        logger.stop()
+    """
+    def __init__(self):
+        self.raw_file = None
+        self.feature_file = None
+        self.raw_writer = None
+        self.feature_writer = None
+        self.last_logged_ts = None  # last brainflow_ts logged for raw samples
+
+    def start(self, eeg_channels, base_dir=".", prefix="eeg_session"):
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        raw_path = os.path.join(base_dir, f"{prefix}_raw_{timestamp_str}.csv")
+        feat_path = os.path.join(base_dir, f"{prefix}_features_{timestamp_str}.csv")
+
+        self.raw_file = open(raw_path, "w", newline="")
+        self.feature_file = open(feat_path, "w", newline="")
+        self.raw_writer = csv.writer(self.raw_file)
+        self.feature_writer = csv.writer(self.feature_file)
+        self.last_logged_ts = None
+
+        # raw header: brainflow_ts + one column per EEG channel
+        raw_header = ["brainflow_ts"] + [f"ch_{ch}" for ch in eeg_channels]
+        self.raw_writer.writerow(raw_header)
+
+        # feature header
+        feat_header = [
+            "brainflow_ts",
+            "delta", "theta", "alpha", "beta", "gamma",
+            "mindfulness_score", "restfulness_score",
+            "mindfulness_detected", "restfulness_detected",
+        ]
+        self.feature_writer.writerow(feat_header)
+
+        print(f"[LOGGER] Raw EEG -> {raw_path}")
+        print(f"[LOGGER] Features -> {feat_path}")
+
+    def log_raw(self, data, timestamp_channel, eeg_channels):
         """
-        intensity = int(np.clip(intensity, 0, 100))
-        # STUB: write to I2C to set ERM/LRA amplitude registers or waveform library scaling
-        # For multiple drivers, iterate self.cfg.drv2605l_addresses
-        # Example:
-        #   for addr in self.cfg.drv2605l_addresses:
-        #       self._write_reg(addr, REG, value)
-        pass
-
-    def play_pattern(self, pattern_id: int, duration_ms: int):
-        """Play a preconfigured haptic pattern for `duration_ms`.
-        Map pattern_id to DRV2605L waveform sequence slots.
+        data: full data matrix from BoardShim.get_current_board_data(...)
+        timestamp_channel: index of BrainFlow timestamp channel
+        eeg_channels: list of EEG channel indices
         """
-        # STUB: select waveform sequence, trigger GO bit, sleep, then stop
-        pass
+        if self.raw_writer is None:
+            return
 
-    def stop_all(self):
-        # STUB: send STOP/standby to all drivers
-        pass
+        timestamps = data[timestamp_channel, :]  # shape: (num_samples,)
+        if timestamps.size == 0:
+            return
 
-    # --- Optional helpers ---
-    def _select_mux_channel(self, ch: int):
-        # STUB: if using TCA9548A, write 1 << ch to mux address
-        pass
+        # Only log samples with timestamp > last_logged_ts
+        for col in range(timestamps.shape[0]):
+            ts = float(timestamps[col])
+            if (self.last_logged_ts is None) or (ts > self.last_logged_ts):
+                row = [ts]
+                for ch_idx in eeg_channels:
+                    row.append(float(data[ch_idx, col]))
+                self.raw_writer.writerow(row)
 
-    def _write_reg(self, addr: int, reg: int, val: int):
-        # STUB: bus.write_byte_data(addr, reg, val)
-        pass
+        self.last_logged_ts = float(timestamps[-1])
 
+    def log_features(self, feature_ts, bands, mind_score, rest_score,
+                     mind_detected, rest_detected):
+        if self.feature_writer is None:
+            return
+        # bands: 5-element vector [delta..gamma]
+        row = [
+            float(feature_ts),
+            float(bands[0]), float(bands[1]), float(bands[2]),
+            float(bands[3]), float(bands[4]),
+            float(mind_score), float(rest_score),
+            int(bool(mind_detected)), int(bool(rest_detected)),
+        ]
+        self.feature_writer.writerow(row)
 
-# =========================
-# EEG/BCI Runtime
-# =========================
-class EEGToHaptics:
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-        self.params = BrainFlowInputParams()
-        self.board = BoardShim(cfg.board_id, self.params)
-        self.stop_event = threading.Event()
-        self.haptics = HapticsDriver(cfg)
-
-        # Prepare ML models for BrainFlow predefined metrics
-        self.models: Dict[str, MLModel] = {}
-        for metric in (BrainFlowMetrics.RELAXATION, BrainFlowMetrics.CONCENTRATION, BrainFlowMetrics.STRESS):
-            p = BrainFlowModelParams(metric.value, BrainFlowClassifiers.DEFAULT_CLASSIFIER.value)
-            m = MLModel(p)
-            m.prepare()
-            self.models[metric.name] = m
-
-        self.sr = None
-        self.eeg_chs: List[int] = []
-        self.window_samples = None
-        self.step_samples = None
-
-    # --------------- Lifecycle ---------------
-    def start(self):
-        BoardShim.enable_dev_board_logger()
-        self.board.prepare_session()
-        self.board.start_stream()
-
-        # Resolve runtime params from board
-        self.sr = BoardShim.get_sampling_rate(self.cfg.board_id)
-        self.eeg_chs = BoardShim.get_eeg_channels(self.cfg.board_id) if self.cfg.eeg_channels is None else self.cfg.eeg_channels
-        self.window_samples = int(self.cfg.window_sec * self.sr)
-        self.step_samples = int(self.cfg.step_sec * self.sr)
-
-        print(f"Connected. sr={self.sr} Hz, eeg_chs={self.eeg_chs}, window={self.window_samples} samples")
-
-        # Warm-up buffer
-        self._wait_for_samples(self.window_samples)
-
-        try:
-            self._run_loop()
-        finally:
-            self.shutdown()
-
-    def shutdown(self):
-        print("Shutting down...")
-        self.haptics.stop_all()  # STUB will be no-op until implemented
-        try:
-            self.board.stop_stream()
-        except Exception:
-            pass
-        try:
-            self.board.release_session()
-        except Exception:
-            pass
-        for m in self.models.values():
-            try:
-                m.release()
-            except Exception:
-                pass
-        self.haptics.close()
-        print("Goodbye.")
-
-    # --------------- Core Loop ---------------
-    def _run_loop(self):
-        last_infer = time.time()
-        residual = np.empty((0, 0))
-
-        while not self.stop_event.is_set():
-            # Sleep until next step (soft real-time)
-            t_next = last_infer + self.cfg.step_sec
-            dt = t_next - time.time()
-            if dt > 0:
-                time.sleep(dt)
-            last_infer = time.time()
-
-            # Get latest chunk
-            data = self.board.get_board_data()
-            if data.size == 0:
-                continue
-
-            eeg = data[self.eeg_chs, :]
-
-            # Keep only last `window_samples` across calls
-            # Concatenate with any residual (if you implement overlap)
-            if eeg.shape[1] >= self.window_samples:
-                eeg_win = eeg[:, -self.window_samples:]
-            else:
-                # If short, pull more data from internal ring buffer
-                needed = self.window_samples - eeg.shape[1]
-                old = self.board.get_current_board_data(needed)
-                eeg_win = np.hstack([old[self.eeg_chs, :], eeg])
-                if eeg_win.shape[1] > self.window_samples:
-                    eeg_win = eeg_win[:, -self.window_samples:]
-
-            # Preprocess per channel
-            for ch_idx in range(eeg_win.shape[0]):
-                DataFilter.detrend(eeg_win[ch_idx], DetrendOperations.CONSTANT.value)
-                DataFilter.perform_bandpass(eeg_win[ch_idx], self.sr, self.cfg.bandpass_low, self.cfg.bandpass_high,
-                                            4, FilterTypes.BUTTERWORTH.value, 0)
-                if self.cfg.notch > 0:
-                    DataFilter.perform_bandstop(eeg_win[ch_idx], self.sr, self.cfg.notch - 2.0, self.cfg.notch + 2.0,
-                                                2, FilterTypes.BUTTERWORTH.value, 0)
-
-            # Compute average band powers (across channels)
-            bands = self._compute_bands(eeg_win)
-            feature_vec = np.array([
-                bands["delta"], bands["theta"], bands["alpha"], bands["beta"], bands["gamma"],
-            ], dtype=np.float32)
-
-            # Predict BrainFlow metrics
-            scores = {
-                "RELAXATION": self.models["RELAXATION"].predict(feature_vec),
-                "CONCENTRATION": self.models["CONCENTRATION"].predict(feature_vec),
-                "STRESS": self.models["STRESS"].predict(feature_vec),
-            }
-
-            # Map to haptics policy
-            intensity, pattern, dur = self._policy(scores)
-
-            # === I2C STUB: Send motor command ===
-            # Replace next two lines by actual I2C writes to DRV2605L
-            # Example implementation sketch:
-            #   self.haptics.set_global_intensity(intensity)
-            #   self.haptics.play_pattern(pattern_id=pattern, duration_ms=dur)
-            print(f"scores={scores} -> intensity={intensity} pattern={pattern} duration_ms={dur}")
-
-    # --------------- Helpers ---------------
-    def _wait_for_samples(self, n: int, timeout: float = 5.0):
-        t0 = time.time()
-        while self.board.get_board_data_count() < n:
-            time.sleep(0.05)
-            if time.time() - t0 > timeout:
-                break
-
-    def _compute_bands(self, eeg_win: np.ndarray) -> Dict[str, float]:
-        """Return mean band powers across channels for delta..gamma."""
-        # BrainFlow helper uses Welch + integration internally
-        avg_bands, _std_bands = DataFilter.get_avg_band_powers(
-            eeg_win, self.eeg_chs, self.sr, True
-        )
-        # avg_bands order: delta, theta, alpha, beta, gamma
-        return {
-            "delta": float(avg_bands[0]),
-            "theta": float(avg_bands[1]),
-            "alpha": float(avg_bands[2]),
-            "beta": float(avg_bands[3]),
-            "gamma": float(avg_bands[4]),
-        }
-
-    def _policy(self, scores: Dict[str, float]) -> Tuple[int, int, int]:
-        """Translate metric scores to (intensity %, pattern_id, duration_ms).
-
-        Suggested behavior (tune as you like):
-        - Encourage relaxed creative state: low RELAXATION → nudge user to relax
-        - Encourage focus when concentration low
-        - Avoid overstimulation when STRESS high (use short, gentle pulses)
-        """
-        relax = float(scores["RELAXATION"])  # 0..1
-        focus = float(scores["CONCENTRATION"])  # 0..1
-        stress = float(scores["STRESS"])  # 0..1
-
-        # Default values
-        intensity = 0
-        pattern_id = 0  # Map to DRV2605L library pattern index later
-        duration_ms = 150
-
-        # Example heuristic policy:
-        if stress > self.cfg.stress_high:
-            # User is stressed → gentle brief cue (short pulse, low intensity)
-            intensity = 30
-            pattern_id = 1  # e.g., soft tap
-            duration_ms = 120
-        elif relax < self.cfg.relax_low:
-            # Needs relaxation → longer pulse to remind to breathe/soften gaze
-            intensity = 60
-            pattern_id = 2  # e.g., slow ramp
-            duration_ms = 400
-        elif focus < self.cfg.focus_low:
-            # Needs focus → quick double tap
-            intensity = 50
-            pattern_id = 3  # e.g., double click
-            duration_ms = 180
-        elif relax > self.cfg.relax_high and focus > self.cfg.focus_high and stress < self.cfg.stress_low:
-            # Ideal creative zone → no vibration
-            intensity = 0
-            pattern_id = 0
-            duration_ms = 0
-        else:
-            # Neutral maintenance cue: very light touch occasionally
-            intensity = 20
-            pattern_id = 4  # e.g., micro buzz
-            duration_ms = 100
-
-        return intensity, pattern_id, duration_ms
+    def stop(self):
+        if self.raw_file is not None:
+            self.raw_file.close()
+            self.raw_file = None
+        if self.feature_file is not None:
+            self.feature_file.close()
+            self.feature_file = None
+        self.raw_writer = None
+        self.feature_writer = None
+        self.last_logged_ts = None
+        print("[LOGGER] Closed log files.")
 
 
-# =========================
-# CLI / Entrypoint
-# =========================
+def main():
+    BoardShim.enable_board_logger()
+    DataFilter.enable_data_logger()
+    MLModel.enable_ml_logger()
 
-def _install_sigint(handler):
-    signal.signal(signal.SIGINT, handler)
-    if hasattr(signal, "SIGTERM"):
-        signal.signal(signal.SIGTERM, handler)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--timeout', type=int, required=False, default=0)
+    parser.add_argument('--ip-port', type=int, required=False, default=0)
+    parser.add_argument('--ip-protocol', type=int, required=False, default=0)
+    parser.add_argument('--ip-address', type=str, required=False, default='')
+    parser.add_argument('--serial-port', type=str, required=False, default='')
+    parser.add_argument('--mac-address', type=str, required=False, default='')
+    parser.add_argument('--other-info', type=str, required=False, default='')
+    parser.add_argument('--streamer-params', type=str, required=False, default='')
+    parser.add_argument('--serial-number', type=str, required=False, default='')
+    parser.add_argument('--file', type=str, required=False, default='')
+    args = parser.parse_args()
 
+    # For the dummy board, we basically don't need any connection params
+    params = BrainFlowInputParams()
+    params.ip_port = args.ip_port
+    params.serial_port = args.serial_port  # ignored by synthetic board
+    params.mac_address = args.mac_address
+    params.other_info = args.other_info
+    params.serial_number = args.serial_number
+    params.ip_address = args.ip_address
+    params.ip_protocol = args.ip_protocol
+    params.timeout = args.timeout
+    params.file = args.file
 
-def main(argv: List[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="EEG→Haptics Interface (BrainFlow metrics)")
-    parser.add_argument("--board", type=int, default=BoardIds.CYTON_BOARD.value, help="BrainFlow Board ID")
-    parser.add_argument("--window", type=float, default=4.0, help="Seconds per inference window")
-    parser.add_argument("--step", type=float, default=1.0, help="Seconds per inference step")
-    parser.add_argument("--notch", type=float, default=60.0, help="Notch center frequency (0 to disable)")
-    args = parser.parse_args(argv)
+    # --- use BrainFlow's synthetic (dummy) board here ---
+    board = BoardShim(BoardIds.SYNTHETIC_BOARD, params)
+    master_board_id = board.get_board_id()
+    sampling_rate = BoardShim.get_sampling_rate(master_board_id)
 
-    cfg = Config(
-        board_id=args.board,
-        window_sec=args.window,
-        step_sec=args.step,
-        notch=args.notch,
-        drv2605l_addresses=[0x5A],  # EDIT: add all your motor driver I2C addresses
+    board.prepare_session()
+    board.start_stream(45000, args.streamer_params)
+    BoardShim.log_message(
+        LogLevels.LEVEL_INFO.value,
+        'Start continuous EEG metric loop (synthetic board)'
     )
+    print("Running real-time EEG + bandpower viewer with SYNTHETIC_BOARD. "
+          "Close the window or Ctrl+C in terminal to exit.\n")
 
-    runtime = EEGToHaptics(cfg)
+    # --- ML models ---
+    mindfulness_params = BrainFlowModelParams(
+        BrainFlowMetrics.MINDFULNESS.value,
+        BrainFlowClassifiers.DEFAULT_CLASSIFIER.value
+    )
+    mindfulness = MLModel(mindfulness_params)
+    mindfulness.prepare()
 
-    def _graceful(sig, frame):
-        print("\nSignal received, exiting...")
-        runtime.stop_event.set()
+    restfulness_params = BrainFlowModelParams(
+        BrainFlowMetrics.RESTFULNESS.value,
+        BrainFlowClassifiers.DEFAULT_CLASSIFIER.value
+    )
+    restfulness = MLModel(restfulness_params)
+    restfulness.prepare()
 
-    _install_sigint(_graceful)
+    MINDFULNESS_THRESHOLD = 0.7
+    RESTFULNESS_THRESHOLD = 0.7
+
+    eeg_channels = BoardShim.get_eeg_channels(int(master_board_id))
+    n_ch = len(eeg_channels)
+    timestamp_channel = BoardShim.get_timestamp_channel(master_board_id)
+
+    # Window length for analysis (seconds) and number of samples per window
+    window_sec = 4.0
+    num_samples = int(window_sec * sampling_rate)
+
+    # ---------- logger setup ----------
+    logger = EEGLogger()
+    logging_enabled = False  # TODO: later wire this to a Qt checkbox
+    if logging_enabled:
+        logger.start(eeg_channels)
+
+    # ---------- pyqtgraph / Qt setup ----------
+    app = pg.mkQApp("EEG + Bandpower Viewer")
+    win = pg.GraphicsLayoutWidget(title="EEG + Bandpower (Synthetic Board)")
+    win.resize(1000, 800)
+
+    # === EEG plot (all channels stacked like OpenBCI) ===
+    eeg_plot = win.addPlot(row=0, col=0, title="EEG Time Series (last window)")
+    eeg_plot.setLabel('bottom', 'Time', units='s')
+    eeg_plot.getAxis('left').setTicks([])       # no y ticks
+    eeg_plot.getAxis('left').setStyle(showValues=False)
+    eeg_plot.showGrid(x=True, y=True, alpha=0.2)
+
+    spacing = 100.0  # vertical spacing between channels in display units
+
+    eeg_curves = []
+    channel_labels = []
+
+    for i, ch in enumerate(eeg_channels):
+        pen = pg.intColor(i, hues=n_ch, maxValue=255)
+        curve = eeg_plot.plot(pen=pen)
+        eeg_curves.append(curve)
+
+        label = pg.TextItem(f"Ch {ch}", color=pen, anchor=(0, 0.5))
+        eeg_plot.addItem(label)
+        channel_labels.append(label)
+
+    rms_labels = []
+    for i in range(n_ch):
+        rms_label = pg.TextItem(
+            "",
+            color='w',
+            anchor=(1, 0.5),
+            fill=pg.mkBrush(0, 0, 0, 180)
+        )
+        eeg_plot.addItem(rms_label)
+        rms_labels.append(rms_label)
+
+    eeg_plot.setYRange(-spacing, spacing * (n_ch + 1))
+
+    # === Bandpower plot (bottom) ===
+    band_plot = win.addPlot(row=1, col=0, title="Bandpower Time Series (last 4 s)")
+    band_plot.setLabel('bottom', 'Time', units='s')
+    band_plot.setLabel('left', 'Power', units='a.u.')
+    band_plot.showGrid(x=True, y=True, alpha=0.2)
+
+    # make left axes the same width so x-axes line up
+    left_axis_width = 60
+    eeg_plot.getAxis('left').setWidth(left_axis_width)
+    band_plot.getAxis('left').setWidth(left_axis_width)
+
+    band_info = [
+        ("Delta", "1–4 Hz"),
+        ("Theta", "4–8 Hz"),
+        ("Alpha", "8–13 Hz"),
+        ("Beta",  "13–30 Hz"),
+        ("Gamma", "30–45 Hz"),
+    ]
+
+    legend = band_plot.addLegend()
+    band_curves = []
+    for i, (name, freq_range) in enumerate(band_info):
+        label = f"{name} ({freq_range})"
+        pen = pg.intColor(i, hues=len(band_info), maxValue=255)
+        curve = band_plot.plot(pen=pen, name=label)
+        band_curves.append(curve)
+
+    band_times = []
+    band_history = [[] for _ in band_info]
+    band_window_sec = 4.0
+    t0 = time.time()
+
+    # --- Metric window (separate) ---
+    metrics_win = QtWidgets.QWidget()
+    metrics_win.setWindowTitle("EEG Metrics")
+    metrics_layout = QtWidgets.QHBoxLayout(metrics_win)
+
+    # Left side: single indicator box + label
+    indicator_layout = QtWidgets.QVBoxLayout()
+
+    mind_color = (0, 200, 255)
+    rest_color = (0, 255, 0)
+
+    status_box = QtWidgets.QFrame()
+    status_box.setFixedSize(40, 40)
+    status_box.setStyleSheet("background-color: gray; border: 1px solid white;")
+
+    status_label = QtWidgets.QLabel("Neither detected")
+    status_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+
+    indicator_layout.addWidget(status_box, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
+    indicator_layout.addWidget(status_label)
+
+    metrics_layout.addLayout(indicator_layout)
+
+    # Right side: metric plot
+    metrics_plot = pg.PlotWidget(title="EEG Metrics (last 4 s)")
+    metrics_plot.setLabel('bottom', 'Time', units='s')
+    metrics_plot.setLabel('left', 'Metric', units='')
+    metrics_plot.setYRange(0.0, 1.0)
+    metrics_plot.setXRange(-4.0, 0.0, padding=0)
+    metrics_plot.showGrid(x=True, y=True, alpha=0.2)
+
+    mind_pen = pg.mkPen(color=mind_color, width=2)
+    rest_pen = pg.mkPen(color=rest_color, width=2)
+
+    mind_curve = metrics_plot.plot(pen=mind_pen, name="Mindfulness")
+    rest_curve = metrics_plot.plot(pen=rest_pen, name="Restfulness")
+
+    mind_thresh_line = pg.InfiniteLine(
+        pos=MINDFULNESS_THRESHOLD,
+        angle=0,
+        pen=pg.mkPen(color=mind_color, style=QtCore.Qt.PenStyle.DotLine)
+    )
+    rest_thresh_line = pg.InfiniteLine(
+        pos=RESTFULNESS_THRESHOLD,
+        angle=0,
+        pen=pg.mkPen(color=rest_color, style=QtCore.Qt.PenStyle.DotLine)
+    )
+    metrics_plot.addItem(mind_thresh_line)
+    metrics_plot.addItem(rest_thresh_line)
+
+    metric_times = []
+    mind_history = []
+    rest_history = []
+
+    metrics_layout.addWidget(metrics_plot)
+    metrics_win.resize(600, 300)
+    metrics_win.show()
+
+    # --- timing / update configuration ---
+    update_speed_ms = 50
+    metrics_period = 1.0
+    last_metrics_time = time.time()
+
+    win.show()
+
+    # ---------- update function called by QTimer ----------
+    def update():
+        nonlocal last_metrics_time
+
+        data = board.get_current_board_data(num_samples)
+        if data.shape[1] < num_samples:
+            return
+
+        # log raw samples if enabled
+        if logging_enabled:
+            logger.log_raw(data, timestamp_channel, eeg_channels)
+
+        # ===== EEG update =====
+        eeg_window = data[eeg_channels, :]
+        t_eeg = np.linspace(-window_sec, 0, num_samples)
+
+        max_abs = float(np.max(np.abs(eeg_window))) if eeg_window.size > 0 else 1.0
+        if max_abs < 1e-6:
+            max_abs = 1.0
+        scale = 0.4 * spacing / max_abs
+
+        vb = eeg_plot.getViewBox()
+        x_min, x_max = vb.viewRange()[0]
+        x_left = x_min + 0.02 * (x_max - x_min)
+        x_right = x_max - 0.02 * (x_max - x_min)
+
+        for idx, curve in enumerate(eeg_curves):
+            if idx < eeg_window.shape[0]:
+                raw_chan = eeg_window[idx, :].astype(float)
+                sig = raw_chan - np.mean(raw_chan)
+                sig = sig * scale
+
+                offset = (n_ch - 1 - idx) * spacing
+                curve.setData(t_eeg, sig + offset)
+
+                channel_labels[idx].setPos(x_left, offset)
+
+                rms_val = np.sqrt(np.mean(raw_chan ** 2))
+                rms_labels[idx].setPos(x_right, offset)
+                rms_labels[idx].setText(f"{rms_val:5.1f} µV")
+
+        eeg_plot.setXRange(-window_sec, 0.0, padding=0)
+
+        # ===== Bandpower every frame =====
+        now = time.time()
+        bands = DataFilter.get_avg_band_powers(
+            data, eeg_channels, sampling_rate, True
+        )
+        feature_vector = bands[0]
+
+        t_now = now - t0
+        band_times.append(t_now)
+        fv = np.asarray(feature_vector).flatten()
+        band_times_rel = [t - t_now for t in band_times]
+
+        for i, curve in enumerate(band_curves):
+            if i < len(fv):
+                band_history[i].append(float(fv[i]))
+                curve.setData(band_times_rel, band_history[i])
+
+        band_plot.setXRange(-band_window_sec, 0.0, padding=0)
+
+        # ===== Metrics & feature logging at slower rate =====
+        if now - last_metrics_time < metrics_period:
+            return
+
+        last_metrics_time = now
+
+        mindfulness_score = float(mindfulness.predict(feature_vector)[0])
+        restfulness_score = float(restfulness.predict(feature_vector)[0])
+
+        mindfulness_detected = mindfulness_score >= MINDFULNESS_THRESHOLD
+        restfulness_detected = restfulness_score >= RESTFULNESS_THRESHOLD
+
+        # metric history for plotting
+        metric_t_now = now - t0
+        metric_times.append(metric_t_now)
+        mind_history.append(mindfulness_score)
+        rest_history.append(restfulness_score)
+
+        metric_times_rel = [t - metric_t_now for t in metric_times]
+        mind_curve.setData(metric_times_rel, mind_history)
+        rest_curve.setData(metric_times_rel, rest_history)
+        metrics_plot.setXRange(-4.0, 0.0, padding=0)
+
+        # log features if enabled
+        if logging_enabled:
+            # use latest BrainFlow timestamp in the window as feature timestamp
+            feature_ts = float(data[timestamp_channel, -1])
+            logger.log_features(
+                feature_ts, feature_vector,
+                mindfulness_score, restfulness_score,
+                mindfulness_detected, restfulness_detected
+            )
+
+        # update indicator box & label
+        gray_style = "background-color: gray; border: 1px solid white;"
+        mind_style = f"background-color: rgb({mind_color[0]},{mind_color[1]},{mind_color[2]}); border: 1px solid white;"
+        rest_style = f"background-color: rgb({rest_color[0]},{rest_color[1]},{rest_color[2]}); border: 1px solid white;"
+
+        if not mindfulness_detected and not restfulness_detected:
+            status_box.setStyleSheet(gray_style)
+            status_label.setText("Neither detected")
+        else:
+            if mindfulness_detected and (not restfulness_detected or mindfulness_score >= restfulness_score):
+                status_box.setStyleSheet(mind_style)
+                status_label.setText("Mindfulness detected")
+            else:
+                status_box.setStyleSheet(rest_style)
+                status_label.setText("Restfulness detected")
+
+        print(
+            f"Mindfulness: {mindfulness_score:.3f} "
+            f"(detected={mindfulness_detected}), "
+            f"Restfulness: {restfulness_score:.3f} "
+            f"(detected={restfulness_detected})"
+        )
+        print()
+
+    timer = QtCore.QTimer()
+    timer.timeout.connect(update)
+    timer.start(update_speed_ms)
 
     try:
-        runtime.start()
-    except KeyboardInterrupt:
-        pass
-
-    return 0
+        QtWidgets.QApplication.instance().exec()
+    finally:
+        board.stop_stream()
+        board.release_session()
+        mindfulness.release()
+        restfulness.release()
+        if logging_enabled:
+            logger.stop()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
